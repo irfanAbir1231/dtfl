@@ -2,6 +2,10 @@ import torch
 import copy
 
 
+def normalize_keys(state_dict):
+    return {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+
 def aggregated_fedavg(w_locals_server_tier, w_locals_client_tier, num_tiers, num_users, whether_local_loss, client_sample, idxs_users, **kwargs):  
     local_v2 = False
     if kwargs:
@@ -12,25 +16,18 @@ def aggregated_fedavg(w_locals_server_tier, w_locals_client_tier, num_tiers, num
                 if k in w_locals_client_tier[t].keys():
                     del w_locals_client_tier[t][k]
     largest_client, largest_server = 0, 0
-    for i in range(0,len(w_locals_client_tier)): # largest model in server-side
-        # if len(w_locals_server_tier[1]) > len(w_locals_server_tier[num_tiers]):
-        #     tier_max = 1
-        # for j in range(0, len(w_locals_client_tier[i])):
+    for i in range(0, len(w_locals_client_tier)): # largest model in server-side
+        # Normalize keys to handle inconsistent formats
+        w_locals_client_tier[i] = normalize_keys(w_locals_client_tier[i])
+
+        # Debugging: Print keys after normalization
+        print(f"Normalized keys for client {i}: {list(w_locals_client_tier[i].keys())}")
+
         if whether_local_loss and not local_v2:
-            # if 'fc.bias' in w_locals_client_tier[i]:
-            # del w_locals_client_tier[i]['fc.bias']
-            # if 'fc.wight' in w_locals_client_tier[i]:
-            # del w_locals_client_tier[i]['fc.weight']
-            del w_locals_client_tier[i]['module.fc.bias']
-            del w_locals_client_tier[i]['module.fc.weight']
-            
-            if 'module.fc.bias' in w_locals_client_tier[i]:
-                del w_locals_client_tier[i]['module.fc.bias']
-            if 'module.fc.weight' in w_locals_client_tier[i]:
-                del w_locals_client_tier[i]['module.fc.weight']
-        # if 
-        # del w_locals_client_tier[i]['linear_2.bias']
-        # del w_locals_client_tier[i]['linear_2.weight']
+            for key in ['fc.bias', 'fc.weight']:
+                if key in w_locals_client_tier[i]:
+                    del w_locals_client_tier[i][key]
+
         if len(w_locals_client_tier[i]) > largest_client:
             largest_client = len(w_locals_client_tier[i])
             id_largest_client = i
