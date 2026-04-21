@@ -23,6 +23,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import math
+import glob
 import os.path
 import pandas as pd
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -53,6 +54,7 @@ from utils.loss import dis_corr
 from utils.fedavg import aggregated_fedavg
 
 from utils.TierScheduler import TierScheduler
+from api.data_preprocessing.ham10000.data_loader import load_partition_data_ham10000
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
 from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
 from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
@@ -103,8 +105,8 @@ def add_args(parser):
     
     
     # Data loading and preprocessing related arguments
-    parser.add_argument('--dataset', type=str, default='cifar10', metavar='N',
-                        help='dataset used for training')
+    parser.add_argument('--dataset', type=str, default='ham10000', metavar='N',
+                        help='dataset used for training: ham10000, flower, cifar10, cifar100, cinic10')
     parser.add_argument('--data_dir', type=str, default='./data', help='data directory')
     parser.add_argument('--partition_method', type=str, default='hetero', metavar='N',
                         help='how to partition the dataset on local workers')
@@ -138,6 +140,53 @@ def add_args(parser):
     args = parser.parse_args()
     return args
 
+
+HAM10000_ALIASES = {"ham10000", "flower", "flower_framework"}
+
+
+def normalize_dataset_name(dataset_name):
+    dataset_key = dataset_name.lower().replace(" ", "_")
+    if dataset_key in HAM10000_ALIASES:
+        return "ham10000"
+    return dataset_key
+
+
+def resolve_ham10000_data_dir(data_dir):
+    candidate_dirs = []
+    if data_dir:
+        candidate_dirs.append(os.path.normpath(data_dir))
+    candidate_dirs.append(os.path.normpath("./Flower Framework"))
+
+    for candidate in candidate_dirs:
+        if os.path.isdir(os.path.join(candidate, "Dataset")):
+            return candidate
+
+    searched_paths = ", ".join(candidate_dirs)
+    raise FileNotFoundError(
+        f"Unable to locate the HAM10000 dataset root. Looked for a 'Dataset' directory in: {searched_paths}"
+    )
+
+
+def discover_ham10000_client_count(data_dir):
+    resolved_data_dir = resolve_ham10000_data_dir(data_dir)
+    client_csvs = sorted(glob.glob(os.path.join(resolved_data_dir, "Dataset", "client_*_train.csv")))
+    if not client_csvs:
+        raise FileNotFoundError(
+            f"No HAM10000 client shard CSVs were found in '{os.path.join(resolved_data_dir, 'Dataset')}'."
+        )
+    return resolved_data_dir, len(client_csvs)
+
+
+def build_criterion(dataset_name, train_loader, num_classes, target_device):
+    if dataset_name != "ham10000":
+        return nn.CrossEntropyLoss()
+
+    labels = np.asarray(train_loader.dataset.target, dtype=np.int64)
+    class_counts = np.bincount(labels, minlength=num_classes)
+    class_weights = labels.size / np.maximum(class_counts, 1) / num_classes
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=target_device)
+    return nn.CrossEntropyLoss(weight=class_weights)
+
 DYNAMIC_LR_THRESHOLD = 0.0001
 DEFAULT_FRAC = 1.0        # participation of clients
 
@@ -149,6 +198,15 @@ NUM_CPUs = os.cpu_count()
 
 parser = argparse.ArgumentParser()
 args = add_args(parser)
+args.dataset = normalize_dataset_name(args.dataset)
+if args.dataset == "ham10000":
+    args.data_dir, detected_client_number = discover_ham10000_client_count(args.data_dir)
+    if args.client_number != detected_client_number:
+        print(
+            f"HAM10000 client count auto-adjusted from {args.client_number} to {detected_client_number} "
+            f"based on the discovered Flower client shards."
+        )
+        args.client_number = detected_client_number
 logging.info(args)
 
     
@@ -172,6 +230,10 @@ if args.dataset == 'cifar10':
     class_num = 10
 elif args.dataset == 'cifar100' or args.dataset == 'cinic10':
     class_num = 100
+elif args.dataset == 'ham10000':
+    class_num = 7
+else:
+    raise ValueError(f"Unsupported dataset '{args.dataset}'.")
 
 
     
@@ -269,8 +331,11 @@ def load_data(args, dataset_name):
     elif dataset_name == "cinic10":
         data_loader = load_partition_data_cinic10
         args.data_dir = './data/cinic10/'
+    elif dataset_name == "ham10000":
+        data_loader = load_partition_data_ham10000
+        args.data_dir = resolve_ham10000_data_dir(args.data_dir)
     else:
-        data_loader = load_partition_data_cifar10
+        raise ValueError(f"Unsupported dataset '{dataset_name}'.")
 
     if dataset_name == "cinic10":
         train_data_num, test_data_num, train_data_global, test_data_global, \
@@ -475,7 +540,7 @@ batch_acc_test = []
 batch_loss_test = []
 
 
-criterion = nn.CrossEntropyLoss()
+criterion = build_criterion(args.dataset, train_data_global, class_num, device)
 count1 = 0
 count2 = 0
 
