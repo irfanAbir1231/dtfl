@@ -1,0 +1,5 @@
+lesion_id,image_id,dx,dx_type,age,sex,localization,label,path
+HAM_0005610,ISIC_0027608,bkl,confocal,65.0,female,face,2,Dataset/HAM10000_images_part_1/ISIC_0027608.jpg
+HAM_0005610,ISIC_0025312,bkl,confocal,65.0,female,face,2,Dataset/HAM10000_images_part_1/ISIC_0025312.jpg
+HAM_0004483,ISIC_0027487,mel,histo,35.0,female,lower extremity,4,Dataset/HAM10000_images_part_1/ISIC_0027487.jpg
+HAM_0001865,ISIC_0032464,nv,follow_up,45.0,male,upper extremity,5,Dataset/HAM10000_images_part_2/ISIC_0032464.jpg
