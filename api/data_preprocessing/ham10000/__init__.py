@@ -1,0 +1,1 @@
+from .data_loader import load_partition_data_ham10000
