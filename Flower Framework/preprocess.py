@@ -27,11 +27,8 @@ def preprocess_metadata(metadata_path, image_dirs):
     label_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
     print(f"Label Mapping: {label_mapping}")
     
-    # B. Handle missing values: Fill NaNs in numeric columns with the median
-    # In HAM10000, 'age' is known to have missing values.
-    print("Handling missing values (filling with median)...")
-    if 'age' in df.columns:
-        df['age'] = df['age'].fillna(df['age'].median())
+    # B. Missing values will be handled after train/test split to prevent data leakage.
+    print("Skipping global missing value imputation (will do post-split)...")
     
     # Map image IDs to their absolute file paths (since they are split across two directories)
     print("Mapping image IDs to physical paths...")
@@ -137,6 +134,13 @@ if __name__ == "__main__":
     train_df = df_processed.iloc[train_idx].copy()
     test_df = df_processed.iloc[test_idx].copy()
     
+    # Prevent data leakage: Fill missing 'age' using training set median
+    if 'age' in train_df.columns:
+        train_median_age = train_df['age'].median()
+        train_df['age'] = train_df['age'].fillna(train_median_age)
+        test_df['age'] = test_df['age'].fillna(train_median_age)
+        print(f"Filled missing 'age' with training median: {train_median_age}")
+    
     # Save the splits
     train_csv = 'Dataset/HAM10000_metadata_train.csv'
     test_csv = 'Dataset/HAM10000_metadata_test.csv'
@@ -170,7 +174,11 @@ if __name__ == "__main__":
     criterion = torch.nn.CrossEntropyLoss(weight=weights)
     print("Class Counts:", class_counts.to_dict())
     print("Weights Tensor:", weights)
-    print("Initialized CrossEntropyLoss with class weights.")
+    
+    # Save weights to disk for federated clients to use
+    weights_path = 'Dataset/class_weights.pt'
+    torch.save(weights, weights_path)
+    print(f"Initialized CrossEntropyLoss and saved class weights to {weights_path}.")
     
     # 5. Create Dataset instances for the splits
     train_dataset = SkinLesionDataset(dataframe=train_df, transform=train_tf)

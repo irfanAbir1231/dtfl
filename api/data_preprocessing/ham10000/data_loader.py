@@ -41,6 +41,8 @@ def _data_transforms_ham10000():
         transforms.Resize((HAM10000_IMAGE_SIZE, HAM10000_IMAGE_SIZE)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(degrees=359),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
@@ -107,7 +109,15 @@ def get_dataloader_ham10000(data_dir, train_bs, test_bs, csv_path_train, csv_pat
     train_ds = HAM10000Dataset(train_df, dataset_root=dataset_root, transform=train_transform)
     test_ds = HAM10000Dataset(test_df, dataset_root=dataset_root, transform=test_transform)
 
-    train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=False)
+    class_counts = train_df['label'].value_counts().to_dict()
+    sample_weights = [1.0 / class_counts[label] for label in train_ds.target]
+    sampler = data.WeightedRandomSampler(
+        weights=sample_weights, 
+        num_samples=len(sample_weights), 
+        replacement=True
+    )
+
+    train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, sampler=sampler, drop_last=False)
     test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=False)
 
     return train_dl, test_dl
