@@ -54,6 +54,7 @@ from utils.loss import dis_corr
 from utils.fedavg import aggregated_fedavg
 
 from utils.TierScheduler import TierScheduler
+from utils.deats import DEATSConfig, DEATSScheduler
 from api.data_preprocessing.ham10000.data_loader import load_partition_data_ham10000
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
 from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
@@ -136,6 +137,26 @@ def add_args(parser):
                     metavar='N', help='list of net speeds in mega bytes')
     parser.add_argument('--delay_coefficient_list', type=str, default=[16, 20, 34, 130, 250],
                     metavar='N', help='list of delay coefficients')
+
+    # DEATS — Dynamic Energy-Aware Tier Scheduling (thesis Section 3.3)
+    parser.add_argument(
+        '--use_deats',
+        action='store_true',
+        default=True,
+        help='Enable battery-aware DEATS tier scheduling (Section 3.3)',
+    )
+    parser.add_argument(
+        '--no_deats',
+        dest='use_deats',
+        action='store_false',
+        help='Use DTFL latency-only tiering without battery model',
+    )
+    parser.add_argument('--deats_ema_alpha', type=float, default=0.3,
+                        help='EMA smoothing for energy rate (Eq. 3.1)')
+    parser.add_argument('--deats_battery_min', type=float, default=5.0,
+                        help='Battery safety floor %% (Eq. 3.4)')
+    parser.add_argument('--deats_energy_scale', type=float, default=0.15,
+                        help='Scale mapping compute/comm load to battery drain')
     
     args = parser.parse_args()
     return args
@@ -285,6 +306,27 @@ delay_coefficient_list = list(np.array(args.delay_coefficient_list) / 14.5)  # t
 
 delay_coefficient = delay_coefficient_list * (args.client_number // 5 + 1)  # coeffieient list for simulation computational power
 delay_coefficient = list(np.array(delay_coefficient))
+
+############### DEATS initialization (Section 3.3) ###############
+deats_scheduler = None
+if args.use_deats:
+    deats_config = DEATSConfig(
+        ema_alpha=args.deats_ema_alpha,
+        battery_min=args.deats_battery_min,
+        energy_scale=args.deats_energy_scale,
+    )
+    deats_scheduler = DEATSScheduler(
+        num_clients=args.client_number,
+        num_tiers=num_tiers,
+        config=deats_config,
+        seed=SEED,
+    )
+    print(
+        f"DEATS enabled — battery-aware dynamic tiering "
+        f"(safety floor {args.deats_battery_min}%)"
+    )
+else:
+    print("DTFL latency-only dynamic tiering (DEATS disabled via --no_deats)")
 
 ############### Client profiles definitions ###############
 client_cpus_gpus = [(0, 0.5, 0), (1, 0.5, 0), (2, 0, 1), (3, 2, 0), (4, 1, 0),
@@ -1043,6 +1085,11 @@ def calculate_client_samples(train_data_local_num_dict, idxs_users, dataset):
 
 for i in range(0, num_users):
     wandb.log({"Client{}_Tier".format(i): num_tiers - client_tier[i] + 1, "epoch": -1}, commit=False)
+    if deats_scheduler is not None:
+        wandb.log({
+            f"Client{i}_Battery": deats_scheduler.battery.get_battery(i),
+            "epoch": -1,
+        }, commit=False)
 
 #------------ Training And Testing  -----------------
 net_glob_client.train()
@@ -1177,7 +1224,18 @@ for iter in range(epochs):
     simulated_delay= np.zeros(num_users)
     
     for idx in idxs_users:
-        
+        if deats_scheduler is not None and not deats_scheduler.battery.is_alive(idx):
+            print(
+                f"Client {idx} skipped — battery at safety floor "
+                f"({args.deats_battery_min}%)"
+            )
+            wandb.log({
+                f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
+                f"Client{idx}_DroppedOut": 1,
+                "epoch": iter,
+            }, commit=False)
+            continue
+
         # Log the client tier for each client in WandB
         wandb.log({"Client{}_Tier".format(idx): num_tiers - client_tier[idx] + 1, "epoch": iter}, commit=False) # tier 1 smallest model
         
@@ -1223,6 +1281,25 @@ for iter in range(epochs):
         simulated_delay[idx] += compute_delay(data_transmitted_client, net_speed[idx]
                                               , delay_coefficient[idx], duration) # this is simulated delay
 
+        if deats_scheduler is not None:
+            energy_drain = deats_scheduler.battery.drain(
+                client_id=idx,
+                duration=duration,
+                data_transmitted=data_transmitted_client,
+                net_speed=net_speed[idx],
+                delay_coefficient=delay_coefficient[idx],
+                code_tier=client_tier[idx],
+                num_tiers=num_tiers,
+            )
+            deats_scheduler.update_ema(idx, energy_drain)
+            deats_scheduler.record_relative_energy(idx, energy_drain)
+            wandb.log({
+                f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
+                f"Client{idx}_EnergyDrain": energy_drain,
+                f"Client{idx}_EMA_Energy": deats_scheduler.battery.clients[idx].ema_energy_rate,
+                "epoch": iter,
+            }, commit=False)
+
         wandb.log({"Client{}_Total_Delay".format(idx): simulated_delay[idx], "epoch": iter}, commit=False)
         
     server_wait_first_to_last_client = (max(simulated_delay * client_epoch) - min(simulated_delay * client_epoch))
@@ -1243,13 +1320,21 @@ for iter in range(epochs):
     idxs_users, m = get_random_user_indices(num_users, DEFAULT_FRAC)
     
         
-    [client_tier, T_max, computation_time_clients] = TierScheduler(computation_time_clients, T_max, client_tier_all = client_tier_all,
-                                                delay_history = simulated_delay_historical_df, 
-                                                num_tiers = num_tiers, client_epoch = client_epoch,
-                                                num_users = num_users, dataset_size = dataset_size,
-                                                batch_size = args.batch_size,
-                                                data_transmitted_client_all = data_transmitted_client_all,
-                                                net_speed = net_speed)
+    [client_tier, T_max, computation_time_clients] = TierScheduler(
+        computation_time_clients,
+        T_max,
+        client_tier_all=client_tier_all,
+        delay_history=simulated_delay_historical_df,
+        num_tiers=num_tiers,
+        client_epoch=client_epoch,
+        num_users=num_users,
+        dataset_size=dataset_size,
+        batch_size=args.batch_size,
+        data_transmitted_client_all=data_transmitted_client_all,
+        net_speed=net_speed,
+        deats_scheduler=deats_scheduler,
+        remaining_rounds=max(epochs - iter - 1, 1),
+    )
     wandb.log({"max_time": T_max, "epoch": iter}, commit=False)
                                                     
     client_tier_all.append(copy.deepcopy(client_tier))

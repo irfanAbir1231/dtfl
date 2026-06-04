@@ -1,160 +1,172 @@
+"""
+Dynamic tier scheduler for split federated learning.
+
+DTFL latency-based tiering (default) plus optional DEATS battery-aware
+assignment (thesis Section 3.3).
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
 
-# Define the smoothing factor (0 < smoothing_factor < 1)
-smoothing_factor = 0.2
-SMALLEST_TIER = 6
+from utils.tier_profiles import (
+    CODE_TIER_CLIENT_PROFILE,
+    CODE_TIER_DATA_SIZE,
+    CODE_TIER_SERVER_PROFILE,
+)
+from utils.deats import DEATSScheduler
 
-def index_of_greatest_smaller(lst, T_max):
-    # Create a new list of all elements in lst that are greater than xx
-    greater_lst = [num for num in lst if num <= T_max]
-    
-    # If greater_lst is empty, return None
-    if not greater_lst:
-        # return None
-        return SMALLEST_TIER, lst[SMALLEST_TIER-1]
-    
-    # Find the smallest number in greater_lst and return its index in lst
-    # smallest = max(greater_lst)
-    
-    # find the one has most layers at the client side
-    smallest = greater_lst[0]
-    return list(lst).index(smallest) + 1, smallest
 
-# index_of_greatest_smaller([1,2,3,4,5] , 4)
+def _profile_fallback(num_tiers: int) -> int:
+    """Shallowest code tier — safe default when history is empty."""
+    return num_tiers
+
+
+def index_of_greatest_smaller(lst, t_max, num_tiers: int):
+    """Pick the deepest tier whose estimated time fits within T_max."""
+    feasible = [num for num in lst if num <= t_max]
+    if not feasible:
+        fallback = _profile_fallback(num_tiers)
+        return fallback, lst[fallback - 1]
+    return list(lst).index(feasible[0]) + 1, feasible[0]
+
 
 def client_time_tier(computation_time_clients, client_tier, num_users, num_tiers):
+    """Build per-(client, tier) computation time history."""
     client_tier_time = {}
-    for i in range(0,num_users):   # this part calculate avg time of each tier each client in window
-        for j in range(1, num_tiers+1): #range(1, num_tiers+1) range(num_tiers,0,-1)
-            client_tier_time[i,j] = []
+    for i in range(num_users):
+        for j in range(1, num_tiers + 1):
+            client_tier_time[i, j] = []
             for t in range(len(client_tier)):
-                if client_tier[t][i] == j and not np.isnan(computation_time_clients[i][t]):
-                    client_tier_time[i,j].append(computation_time_clients[i][t])
-                    
+                if (
+                    client_tier[t][i] == j
+                    and not np.isnan(computation_time_clients[i][t])
+                ):
+                    client_tier_time[i, j].append(computation_time_clients[i][t])
     return client_tier_time
-                    
-                        
-                        
-                        
 
-def TierScheduler(computation_time_clients, T_max, **kwargs):
 
-                      
-    if kwargs:
-        client_tier = kwargs['client_tier_all']
-        delay_history = kwargs['delay_history']
-        num_tiers = kwargs['num_tiers']
-        num_users = kwargs['num_users']
-        dataset_size = kwargs['dataset_size']
-        batch_size = kwargs['batch_size']
-        net_speed = kwargs['net_speed']
+def _estimate_tier_times(
+    current_tier: int,
+    current_comp_estimation_time: float,
+    batch_num: float,
+    net_speed: float,
+    num_tiers: int,
+) -> Dict[int, float]:
+    """Estimate round completion time for each candidate tier."""
+    fallback = _profile_fallback(num_tiers)
+    estimates = {}
+    for m in range(1, num_tiers + 1):
+        client_profile = CODE_TIER_CLIENT_PROFILE.get(
+            m, CODE_TIER_CLIENT_PROFILE.get(fallback, 0.019)
+        )
+        current_profile = CODE_TIER_CLIENT_PROFILE.get(
+            current_tier, CODE_TIER_CLIENT_PROFILE.get(fallback, 0.019)
+        )
+        data_size = CODE_TIER_DATA_SIZE.get(
+            m, CODE_TIER_DATA_SIZE.get(fallback, 0)
+        )
+        server_profile = CODE_TIER_SERVER_PROFILE.get(
+            m, CODE_TIER_SERVER_PROFILE.get(fallback, 0.133)
+        )
 
-    # T_max = max(T_r)
-    
-    
-    #### profiling
-    MB = 1024 ** 2
-    total_data_size_tier = {1:0.629 * MB, 2:313.9 * MB, 3:625.6 * MB, 4:625.2 * MB, 5:1250.1 * MB, 6:1250.3 * MB, 7:312.6 * MB}
-    
-    total_data_size_tier = {
-        1: 0.629 * MB,
-        2: 0.6278 * MB,
-        3: 1.2512 * MB,
-        4: 1.2504 * MB,
-        5: 2.5002 * MB,
-        6: 2.5006 * MB,
+        client_time = (
+            client_profile / current_profile * current_comp_estimation_time
+            + data_size * batch_num / net_speed
+        )
+        server_time = (data_size / net_speed + server_profile) * batch_num
+        estimates[m] = max(server_time, client_time)
+    return estimates
+
+
+def TierScheduler(
+    computation_time_clients,
+    t_max,
+    deats_scheduler: Optional[DEATSScheduler] = None,
+    remaining_rounds: int = 1,
+    **kwargs,
+):
+    """
+    Assign tiers for the next FL round.
+
+    With ``deats_scheduler``, uses DEATS (time + energy + fairness + battery).
+    Otherwise uses DTFL latency-only policy.
+    """
+    client_tier = kwargs["client_tier_all"]
+    delay_history = kwargs["delay_history"]
+    num_tiers = kwargs["num_tiers"]
+    num_users = kwargs["num_users"]
+    dataset_size = kwargs["dataset_size"]
+    batch_size = kwargs["batch_size"]
+    net_speed = kwargs["net_speed"]
+
+    batch_num_clients = {
+        key: value / batch_size for key, value in dataset_size.items()
     }
-        
-    profile_client_side = {
-        6: 0.160,
-        5: 0.118,
-        4: 0.065,
-        3: 0.060,
-        2: 0.037,
-        1: 0.019
-    }
-    
-    profile_server_side = {
-        6: 0.005,
-        5: 0.026,
-        4: 0.063,
-        3: 0.098,
-        2: 0.105,
-        1: 0.133
-    }
-    
-    # as the tier naming is in opsite order of the paper
-    total_data_size_tier = {
-        6: 0.6278 * MB,
-        5: 0.629 * MB,
-        4: 1.2504 * MB,
-        3: 1.2512 * MB,
-        2: 2.5006 * MB,
-        1: 2.5002 * MB,
-    }
-        
-    profile_client_side = {
-        1: 0.160,
-        2: 0.118,
-        3: 0.065,
-        4: 0.060,
-        5: 0.037,
-        6: 0.019
-    }
-    
-    profile_server_side = {
-        1: 0.005,
-        2: 0.026,
-        3: 0.063,
-        4: 0.098,
-        5: 0.105,
-        6: 0.133
-    }
-    
-    
-    batch_num_clients = {key: value / batch_size for key, value in dataset_size.items()}
-    # transfer_data_size_client = 
+
     for k in range(num_users):
-        transfer_data_size_client = batch_num_clients[k] * total_data_size_tier[client_tier[-1][k]]
-        communication_time_clients = transfer_data_size_client / net_speed[k]
-        
-        computation_time_clients[k].append(delay_history[k].iloc[-1] - communication_time_clients)
-    
-    
-    time_estimation_client = {}
-    client_tier_next = {}
-    client_times_tier = client_time_tier(computation_time_clients, client_tier, num_users, num_tiers)
-    
-    for k in range(num_users):
-        
-        times_last_tier = client_times_tier[k,client_tier[-1][k]]
-        if times_last_tier:
-            # current_comp_estimation_time = pd.DataFrame({"Times":computation_time_clients[k]})['Times'].ewm(span=10, adjust=False).mean().iloc[-1]
-            current_comp_estimation_time = pd.DataFrame({"Times":times_last_tier})['Times'].ewm(span=2, adjust=False).mean().iloc[-1]
-            
-            time_estimation_sever_side = {}
-            time_estimation_client_side = {}
-            time_estimation = {}
-            
-            for m in range(1,num_tiers):
-                
-                # estimate time for each tier
-                
-                time_estimation_client_side[m] = (profile_client_side[m] / profile_client_side[client_tier[-1][k]] * current_comp_estimation_time
-                                                 + total_data_size_tier[m] * batch_num_clients[k] / net_speed[k])
-                
-                time_estimation_sever_side[m] = (total_data_size_tier[m] / net_speed[k] + profile_server_side[m]) * batch_num_clients[k]
-                time_estimation[m] = max(time_estimation_sever_side[m], time_estimation_client_side[m])
-                
-            time_estimation_list = [time_estimation[key] for key in sorted(time_estimation.keys())]
-            time_estimation_client[k] = min(time_estimation_list)
-            
-            client_tier_next[k], _ = index_of_greatest_smaller(time_estimation_list, T_max)
+        current_tier = client_tier[-1][k]
+        transfer_data_size = (
+            batch_num_clients[k] * CODE_TIER_DATA_SIZE.get(current_tier, 0)
+        )
+        communication_time = transfer_data_size / net_speed[k]
+        last_delay = delay_history[k].iloc[-1]
+        if pd.isna(last_delay):
+            computation_time_clients[k].append(np.nan)
         else:
-            client_tier_next[k] = SMALLEST_TIER
-        
-    T_max = max([time_estimation_client[key] for key in sorted(time_estimation_client.keys())])
-    #print('T_max: ', T_max)
-    
-    return client_tier_next, T_max, computation_time_clients
+            computation_time_clients[k].append(last_delay - communication_time)
+
+    client_tier_next = {}
+    time_estimation_client = {}
+    client_times_tier = client_time_tier(
+        computation_time_clients, client_tier, num_users, num_tiers
+    )
+    shallow_fallback = _profile_fallback(num_tiers)
+
+    for k in range(num_users):
+        current_tier = client_tier[-1][k]
+        times_last_tier = client_times_tier[k, current_tier]
+
+        if not times_last_tier:
+            client_tier_next[k] = shallow_fallback
+            continue
+
+        current_comp_estimation_time = (
+            pd.DataFrame({"Times": times_last_tier})["Times"]
+            .ewm(span=2, adjust=False)
+            .mean()
+            .iloc[-1]
+        )
+
+        time_estimation = _estimate_tier_times(
+            current_tier,
+            current_comp_estimation_time,
+            batch_num_clients[k],
+            net_speed[k],
+            num_tiers,
+        )
+        time_estimation_list = [time_estimation[m] for m in sorted(time_estimation)]
+        time_estimation_client[k] = min(time_estimation_list)
+
+        if deats_scheduler is not None:
+            if not deats_scheduler.battery.is_alive(k):
+                client_tier_next[k] = num_tiers
+                continue
+
+            selected, _ = deats_scheduler.select_tier(
+                client_id=k,
+                time_estimates=time_estimation,
+                remaining_rounds=remaining_rounds,
+                t_max=t_max,
+            )
+            client_tier_next[k] = selected
+        else:
+            client_tier_next[k], _ = index_of_greatest_smaller(
+                time_estimation_list, t_max, num_tiers
+            )
+
+    t_max = max(time_estimation_client.values()) if time_estimation_client else t_max
+    return client_tier_next, t_max, computation_time_clients
