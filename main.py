@@ -52,6 +52,14 @@ from model.resnet import resnet110_SFL_local_tier_7
 from utils.loss import PatchShuffle
 from utils.loss import dis_corr
 from utils.fedavg import aggregated_fedavg
+from utils.privacy import (
+    noise_schedule,
+    clip_features,
+    add_gaussian_noise,
+    compute_snr,
+    compute_corr_drop,
+    get_dp_epsilon,
+)
 
 from utils.TierScheduler import TierScheduler
 from api.data_preprocessing.ham10000.data_loader import load_partition_data_ham10000
@@ -124,10 +132,39 @@ def add_args(parser):
     parser.add_argument('--tier', default=5, type=int)
         
     
-    # Privacy related arguments
+    # Decorrelation / obfuscation arguments (pre-existing)
     parser.add_argument('--whether_dcor', default=False, type=bool)
     parser.add_argument('--dcor_coefficient', default=0.5, type=float)  # same as alpha in paper
-    parser.add_argument('--PatchShuffle', default=0, type=int)  
+    parser.add_argument('--PatchShuffle', default=0, type=int)
+
+    # -----------------------------------------------------------------------
+    # Differential-privacy / smashed-tensor protection arguments
+    # (see privacy-implementation-plan.md §1)
+    # -----------------------------------------------------------------------
+    # Master switch: set True to enable clipping + noise on the smashed tensor
+    parser.add_argument('--privacy_enable', default=False, type=bool,
+                        help='Enable L2-clipping and Gaussian noise on smashed tensor (DP-SL).')
+    # L2 sensitivity / clipping bound C
+    parser.add_argument('--clip_C', default=1.0, type=float,
+                        help='L2 norm clipping bound for per-sample smashed features.')
+    # Initial noise multiplier (sigma at round 0)
+    parser.add_argument('--noise_sigma0', default=1.0, type=float,
+                        help='Initial Gaussian noise multiplier sigma_0 (noise std = sigma_t * clip_C).')
+    # Minimum noise multiplier (floor of the decay schedule)
+    parser.add_argument('--noise_sigma_min', default=0.05, type=float,
+                        help='Minimum noise multiplier; noise never falls below sigma_min * clip_C.')
+    # Multiplicative decay applied each round: sigma_t = max(sigma_min, sigma0 * decay^t)
+    parser.add_argument('--noise_decay', default=0.97, type=float,
+                        help='Multiplicative per-round noise decay factor in (0, 1).')
+    # Target delta for (epsilon, delta)-DP accounting
+    parser.add_argument('--privacy_delta', default=1e-5, type=float,
+                        help='Target delta for (eps, delta)-DP accounting via opacus.')
+    # Enable computation and logging of SNR and correlation-drop metrics
+    parser.add_argument('--privacy_metrics', default=True, type=bool,
+                        help='Compute and log SNR and correlation-drop privacy metrics to W&B.')
+    # How often (in rounds) to log detailed privacy metrics
+    parser.add_argument('--privacy_log_interval', default=1, type=int,
+                        help='Log privacy metrics every N rounds.')
     
     
     
@@ -251,6 +288,21 @@ whether_dcor = args.whether_dcor
 dcor_coefficient = args.dcor_coefficient
 tier = args.tier
 client_epoch = args.client_epoch
+
+# ---------------------------------------------------------------------------
+# Privacy globals  (privacy-implementation-plan.md §1 + §2)
+# These are read once from args and referenced throughout training.
+# ---------------------------------------------------------------------------
+privacy_enable       = args.privacy_enable          # master on/off switch
+clip_C               = args.clip_C                  # L2 clipping bound C
+noise_sigma0         = args.noise_sigma0             # initial noise multiplier
+noise_sigma_min      = args.noise_sigma_min          # floor of decay schedule
+noise_decay          = args.noise_decay              # per-round decay factor
+privacy_delta        = args.privacy_delta            # δ for (ε, δ)-DP
+privacy_metrics      = args.privacy_metrics          # enable metric computation
+privacy_log_interval = args.privacy_log_interval     # log every N rounds
+# sigma_t is updated at the start of each round in the main loop
+sigma_t = noise_sigma0  # initialise to sigma_0
 client_epoch = np.ones(args.client_number,dtype=int) * client_epoch
 
 client_type_percent = [0.0, 0.0, 0.0, 0.0, 1.0]
@@ -879,7 +931,6 @@ class Client(object):
     def train(self, net):
         net.train()
         self.lr , lr = new_lr, new_lr
-        
 
         if args.optimizer == "Adam":
             optimizer_client =  torch.optim.Adam(net.parameters(), lr=lr, weight_decay=args.wd, amsgrad=True) # from fedgkt code
@@ -887,11 +938,18 @@ class Client(object):
             optimizer_client =  torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9,
                                                       nesterov=True,
                                                       weight_decay=args.wd)
-        
+
         time_client=0
         client_intermediate_data_size = 0
         CEloss_client_train = []
         Dcorloss_client_train = []
+
+        # ---------------------------------------------------------------
+        # Privacy metric accumulators (privacy-implementation-plan.md §4,§5)
+        # Collected per-batch and averaged at end of training call.
+        # ---------------------------------------------------------------
+        batch_snr_list       = []   # SNR values across batches
+        batch_corr_drop_list = []   # correlation-drop values across batches
 
         for iter in range(self.local_ep):
             len_batch = len(self.ldr_train)
@@ -899,62 +957,110 @@ class Client(object):
                 time_s = time.time()
                 images, labels = images.to(self.device), labels.to(self.device)
                 optimizer_client.zero_grad()
-                
-                    
+
                 #---------forward prop-------------
                 extracted_features, fx = net(images)
 
-                
+                # -----------------------------------------------------------
+                # Privacy mechanism on the smashed tensor fx
+                # (privacy-implementation-plan.md §3)
+                #
+                # Execution order:
+                #   1. Optional PatchShuffle obfuscation (pre-existing).
+                #   2. L2 per-sample norm clipping to bound sensitivity.
+                #   3. Gaussian noise injection calibrated to sigma_t * clip_C.
+                #   4. The noisy tensor is sent to the server — the server
+                #      receives *only* the protected version.
+                # -----------------------------------------------------------
                 if args.PatchShuffle == 1:
-                    fx_shuffled = fx.clone().detach().requires_grad_(False)
-                    fx_shuffled = PatchShuffle(fx_shuffled)
-                    client_fx = fx_shuffled.clone().detach().requires_grad_(True)
+                    # Apply patch shuffle before any further processing
+                    fx_for_server = fx.clone().detach().requires_grad_(False)
+                    fx_for_server = PatchShuffle(fx_for_server)
                 else:
-                    client_fx = fx.clone().detach().requires_grad_(True)
-                
-                
-                # Sending activations to server and receiving gradients from server
+                    fx_for_server = fx.clone().detach()
+
+                if privacy_enable:
+                    # Step 2: L2 per-sample clipping (§3 step 2)
+                    fx_clipped = clip_features(fx_for_server, clip_C)
+
+                    # Step 3: Gaussian noise injection (§3 step 3)
+                    #   noise std per element = sigma_t * clip_C
+                    fx_noisy = add_gaussian_noise(fx_clipped, sigma_t, clip_C)
+
+                    # The server receives the noisy (protected) activation
+                    client_fx = fx_noisy.clone().detach().requires_grad_(True)
+
+                    # Step 4: Compute and accumulate privacy metrics (§4, §5)
+                    # Only compute when privacy_metrics is enabled and on the
+                    # configured logging interval (checked at epoch end below).
+                    if privacy_metrics:
+                        # §4  SNR: signal power / noise power
+                        snr_val = compute_snr(fx_clipped, fx_noisy)
+                        batch_snr_list.append(snr_val)
+
+                        # §5  Correlation drop: relative dCor reduction
+                        corr_drop_val = compute_corr_drop(
+                            images, fx_clipped, fx_noisy
+                        )
+                        batch_corr_drop_list.append(corr_drop_val)
+                else:
+                    # Privacy disabled: send the (possibly shuffled) tensor
+                    # unchanged — identical to the original behaviour.
+                    client_fx = fx_for_server.clone().detach().requires_grad_(True)
+
+                # -----------------------------------------------------------
+                # Sending activations to server and receiving gradients
+                # -----------------------------------------------------------
                 time_client += time.time() - time_s
                 dfx = train_server(client_fx, labels, iter, self.local_ep, self.idx, len_batch, _)
-                
-                
+
                 #--------backward prop -------------
                 time_s = time.time()
-                
+
                 labels = labels.to(torch.long)
-                loss = criterion(extracted_features, labels) # to solve change dataset)
-                CEloss_client_train.append(((1 - dcor_coefficient)*loss.item()))    
-                
-                
-                    
+                loss = criterion(extracted_features, labels) # to solve change dataset
+                CEloss_client_train.append(((1 - dcor_coefficient)*loss.item()))
+
                 if whether_dcor:
-                    Dcor_value = dis_corr(images,fx)
+                    Dcor_value = dis_corr(images, fx)
                     loss = (1 - dcor_coefficient) * loss + dcor_coefficient * Dcor_value
-                    Dcorloss_client_train.append(((dcor_coefficient) * Dcor_value))   
-                    
+                    Dcorloss_client_train.append(((dcor_coefficient) * Dcor_value))
 
                 loss.backward()
 
-                    
                 optimizer_client.step()
                 time_client += time.time() - time_s
-                
-                
-                client_intermediate_data_size += (sys.getsizeof(client_fx.storage()) + 
+
+                client_intermediate_data_size += (sys.getsizeof(client_fx.storage()) +
                                       sys.getsizeof(labels.storage()))
-                    
-                
-            
-            
+
         global intermediate_data_size
-        intermediate_data_size += client_intermediate_data_size          
-            
-        
-        # clients log
-        wandb.log({"Client{}_DcorLoss".format(idx): float(sum(Dcorloss_client_train)), "epoch": iter}, commit=False)
-        wandb.log({"Client{}_time_not_scaled (s)".format(idx): time_client, "epoch": iter}, commit=False)
-        
-        return net.state_dict(), time_client, client_intermediate_data_size 
+        intermediate_data_size += client_intermediate_data_size
+
+        # -------------------------------------------------------------------
+        # W&B logging — client-level metrics
+        # -------------------------------------------------------------------
+        # Pre-existing decorrelation loss log
+        wandb.log({"Client{}_DcorLoss".format(self.idx): float(sum(Dcorloss_client_train)), "epoch": iter}, commit=False)
+        wandb.log({"Client{}_time_not_scaled (s)".format(self.idx): time_client, "epoch": iter}, commit=False)
+
+        # Privacy metrics: averaged over all batches in this training call
+        # (privacy-implementation-plan.md §4, §5, §7)
+        if privacy_enable and privacy_metrics:
+            if batch_snr_list:
+                avg_snr = sum(batch_snr_list) / len(batch_snr_list)
+                wandb.log(
+                    {"Privacy/SNR_client{}".format(self.idx): avg_snr, "epoch": iter},
+                    commit=False,
+                )
+            if batch_corr_drop_list:
+                avg_corr_drop = sum(batch_corr_drop_list) / len(batch_corr_drop_list)
+                wandb.log(
+                    {"Privacy/corr_drop_client{}".format(self.idx): avg_corr_drop, "epoch": iter},
+                    commit=False,
+                )
+
+        return net.state_dict(), time_client, client_intermediate_data_size
     
     def evaluate(self, net, ell):
         net.eval()
@@ -1134,8 +1240,17 @@ computation_time_clients = {}
 for k in range(num_users):
     computation_time_clients[k] = []
 
-# Main loop over rounds    
+# Main loop over rounds
 for iter in range(epochs):
+    # -------------------------------------------------------------------
+    # Privacy: adaptive noise schedule  (privacy-implementation-plan.md §2)
+    # Compute sigma_t for this round: sigma_t = max(sigma_min, sigma0 * decay^t)
+    # sigma_t is declared global so Client.train() can read it without passing
+    # it as a parameter (consistent with how other globals like `new_lr` are used).
+    # -------------------------------------------------------------------
+    sigma_t = noise_schedule(iter, noise_sigma0, noise_sigma_min, noise_decay)  # noqa: F811
+    if privacy_enable:
+        wandb.log({"Privacy/sigma_t": sigma_t, "epoch": iter}, commit=False)
     if iter == int(50): # here we can change how the enviroement randomly change 
         continue
         delay_coefficient[0] = delay_coefficient_list[2]
@@ -1226,7 +1341,7 @@ for iter in range(epochs):
         wandb.log({"Client{}_Total_Delay".format(idx): simulated_delay[idx], "epoch": iter}, commit=False)
         
     server_wait_first_to_last_client = (max(simulated_delay * client_epoch) - min(simulated_delay * client_epoch))
-    training_time = (max(simulated_delay)) 
+    training_time = (max(simulated_delay))
     total_training_time += training_time
     if iter == 0:
         first_training_time = training_time
@@ -1234,6 +1349,33 @@ for iter in range(epochs):
     times_in_server = []
     time_train_server_train_all_list.append(time_train_server_train_all)
     time_train_server_train_all = 0
+
+    # -------------------------------------------------------------------
+    # Privacy: per-round aggregate logging and (ε, δ)-DP accounting
+    # (privacy-implementation-plan.md §6, §7)
+    # -------------------------------------------------------------------
+    if privacy_enable and privacy_metrics and (iter % privacy_log_interval == 0):
+        # Log the current noise multiplier (already logged above, duplicated
+        # here with commit=False so it groups with the DP epsilon in one step)
+        wandb.log({"Privacy/noise_multiplier": sigma_t, "epoch": iter}, commit=False)
+
+        # (ε, δ)-DP accounting via Opacus (§6)
+        # Sampling rate q = batch_size / avg local dataset size
+        q = args.batch_size / max(avg_dataset, 1)
+        # Steps consumed this round: one optimizer step per batch per client epoch
+        # (conservative: uses the maximum local epoch count)
+        steps_this_round = int(len(idxs_users) * max(client_epoch))
+        epsilon = get_dp_epsilon(
+            sample_rate=q,
+            noise_multiplier=sigma_t,
+            num_steps=steps_this_round,
+            delta=privacy_delta,
+        )
+        if epsilon is not None:
+            wandb.log({"Privacy/epsilon": epsilon, "epoch": iter}, commit=False)
+            print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | epsilon={epsilon:.4f} | delta={privacy_delta}")
+        else:
+            print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | (ε,δ) accounting unavailable (install opacus)")
      
     simulated_delay[simulated_delay==0] = np.nan  # convert zeros to nan, for when some clients not involved in the epoch
     simulated_delay_historical_df = pd.concat([simulated_delay_historical_df, pd.DataFrame(simulated_delay).T], ignore_index=True)
