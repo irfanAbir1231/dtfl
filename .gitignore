@@ -1,2 +1,13 @@
 .venv/
 .venv
+/wandb/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
