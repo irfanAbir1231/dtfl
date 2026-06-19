@@ -1337,20 +1337,43 @@ for iter in range(epochs):
     processes = []
     
     simulated_delay= np.zeros(num_users)
-    
-    for idx in idxs_users:
-        if deats_scheduler is not None and not deats_scheduler.battery.is_alive(idx):
-            print(
-                f"Client {idx} skipped — battery at safety floor "
-                f"({args.deats_battery_min}%)"
-            )
-            wandb.log({
-                f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
-                f"Client{idx}_DroppedOut": 1,
-                "epoch": iter,
-            }, commit=False)
-            continue
 
+    # ------------------------------------------------------------------
+    # DEATS dropout handling (FIX)
+  
+    if deats_scheduler is not None:
+        active_idxs_users = [i for i in idxs_users if deats_scheduler.battery.is_alive(i)]
+        dropped_idxs_users = [i for i in idxs_users if not deats_scheduler.battery.is_alive(i)]
+    else:
+        active_idxs_users = list(idxs_users)
+        dropped_idxs_users = []
+
+    # Log dropped-out clients (battery at safety floor) for this round
+    for idx in dropped_idxs_users:
+        print(
+            f"Client {idx} skipped — battery at safety floor "
+            f"({args.deats_battery_min}%)"
+        )
+        wandb.log({
+            f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
+            f"Client{idx}_DroppedOut": 1,
+            "epoch": iter,
+        }, commit=False)
+
+    # Federation this round completes based on the clients that train.
+    # `m` is read as a global inside train_server's federation trigger.
+    m = len(active_idxs_users)
+
+    # If every sampled client has dropped out, there is nothing to train or
+    # aggregate this round — skip safely instead of deadlocking the loop.
+    if m == 0:
+        print(f"Round {iter}: all sampled clients dropped out — skipping round.")
+        wandb.log({"Active_Clients": 0, "epoch": iter}, commit=True)
+        continue
+
+    wandb.log({"Active_Clients": m, "epoch": iter}, commit=False)
+
+    for idx in active_idxs_users:
         # Log the client tier for each client in WandB
         wandb.log({"Client{}_Tier".format(idx): num_tiers - client_tier[idx] + 1, "epoch": iter}, commit=False) # tier 1 smallest model
         
@@ -1372,8 +1395,10 @@ for iter in range(epochs):
         w_locals_client.append(copy.deepcopy(w_client))
         w_locals_client_tier[client_tier[idx]].append(copy.deepcopy(w_client))
         
-        # Testing -------------------  
-        if idx == idxs_users[-1]:
+        # Testing -------------------
+        # Use the last *active* client so evaluation still runs when the
+        # originally-sampled last client has dropped out (DEATS).
+        if idx == active_idxs_users[-1]:
             net = copy.deepcopy(net_glob_client)
             w_previous = copy.deepcopy(net.state_dict())  # to test for updated model
             net.load_state_dict(w_client)
@@ -1440,8 +1465,10 @@ for iter in range(epochs):
         # Sampling rate q = batch_size / avg local dataset size
         q = args.batch_size / max(avg_dataset, 1)
         # Steps consumed this round: one optimizer step per batch per client epoch
-        # (conservative: uses the maximum local epoch count)
-        steps_this_round = int(len(idxs_users) * max(client_epoch))
+        # (conservative: uses the maximum local epoch count).
+        # Use the active-client count (m) so DP accounting reflects the
+        # clients that actually trained after DEATS dropouts.
+        steps_this_round = int(m * max(client_epoch))
         epsilon = get_dp_epsilon(
             sample_rate=q,
             noise_multiplier=sigma_t,
@@ -1493,7 +1520,11 @@ for iter in range(epochs):
     print("-----------------------------------------------------------")
     
     # calculate the number of samples in each client
-    client_sample = calculate_client_samples(train_data_local_num_dict, idxs_users, args.dataset) # same order as appended weights
+    # Use the clients that actually trained this round (active_idxs_users),
+    # in the same order their weights were appended to w_locals_client.
+    # Using idxs_users here was incorrect because it is reassigned above to
+    # the *next* round's sample, which misaligned the FedAvg weighting.
+    client_sample = calculate_client_samples(train_data_local_num_dict, active_idxs_users, args.dataset) # same order as appended weights
         
 
     
