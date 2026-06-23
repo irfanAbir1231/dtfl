@@ -192,8 +192,12 @@ def add_args(parser):
                         help='EMA smoothing for energy rate (Eq. 3.1)')
     parser.add_argument('--deats_battery_min', type=float, default=5.0,
                         help='Battery safety floor %% (Eq. 3.4)')
-    parser.add_argument('--deats_energy_scale', type=float, default=0.15,
+    parser.add_argument('--deats_energy_scale', type=float, default=0.03,
                         help='Scale mapping compute/comm load to battery drain')
+    parser.add_argument('--deats_battery_init_min', type=float, default=65.0,
+                        help='Minimum initial battery %% for simulated clients')
+    parser.add_argument('--deats_battery_init_max', type=float, default=100.0,
+                        help='Maximum initial battery %% for simulated clients')
     
     args = parser.parse_args()
     return args
@@ -366,6 +370,8 @@ if args.use_deats:
         ema_alpha=args.deats_ema_alpha,
         battery_min=args.deats_battery_min,
         energy_scale=args.deats_energy_scale,
+        battery_init_min=args.deats_battery_init_min,
+        battery_init_max=args.deats_battery_init_max,
     )
     deats_scheduler = DEATSScheduler(
         num_clients=args.client_number,

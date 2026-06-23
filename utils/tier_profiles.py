@@ -82,12 +82,12 @@ def paper_tiers_for_battery(battery_percent: float, num_tiers: int) -> List[int]
     Return allowed *code* tier indices based on battery level (Table 3.1, thesis).
 
     High battery   (>70 %): deep tiers  — paper 5–7
-    Medium battery (30–70 %): medium tiers — paper 3–4
-    Low battery    (≤30 %): shallow tiers — paper 1–2
+    Medium battery (45–70 %): medium tiers — paper 3–4
+    Low battery    (≤45 %): shallow tiers — paper 1–2
     """
     if battery_percent > 70.0:
         paper_range = range(max(1, num_tiers - 2), num_tiers + 1)
-    elif battery_percent > 30.0:
+    elif battery_percent > 45.0:
         mid = num_tiers // 2
         paper_range = range(max(1, mid - 1), min(num_tiers, mid + 1) + 1)
     else:

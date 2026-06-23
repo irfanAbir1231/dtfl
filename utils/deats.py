@@ -31,12 +31,12 @@ class DEATSConfig:
     ema_alpha: float = 0.3
     energy_comp_weight: float = 0.7
     energy_comm_weight: float = 0.3
-    score_time_weight: float = 0.4
-    score_energy_weight: float = 0.4
-    score_fairness_weight: float = 0.2
+    score_time_weight: float = 0.30
+    score_energy_weight: float = 0.35
+    score_fairness_weight: float = 0.35
     battery_min: float = 5.0
-    energy_scale: float = 0.15
-    battery_init_min: float = 20.0
+    energy_scale: float = 0.03
+    battery_init_min: float = 65.0
     battery_init_max: float = 100.0
 
 
@@ -189,7 +189,10 @@ class DEATSScheduler:
         """Estimated energy cost per round at tier m (Eq. 3.3)."""
         ema = self.battery.clients[client_id].ema_energy_rate
         if ema <= 0.0:
-            ema = 0.5
+            # Conservative bootstrap before first measurements arrive.
+            # A larger default avoids optimistic survivability estimates
+            # that can over-assign heavy tiers in early rounds.
+            ema = 2.0
         return ema * self.energy_ratio(code_tier)
 
     def survivable_rounds(self, client_id: int, code_tier: int) -> float:
