@@ -192,7 +192,7 @@ def add_args(parser):
                         help='EMA smoothing for energy rate (Eq. 3.1)')
     parser.add_argument('--deats_battery_min', type=float, default=5.0,
                         help='Battery safety floor %% (Eq. 3.4)')
-    parser.add_argument('--deats_energy_scale', type=float, default=0.03,
+    parser.add_argument('--deats_energy_scale', type=float, default=0.004,
                         help='Scale mapping compute/comm load to battery drain')
     parser.add_argument('--deats_battery_init_min', type=float, default=65.0,
                         help='Minimum initial battery %% for simulated clients')
@@ -1360,6 +1360,11 @@ for iter in range(epochs):
             f"Client {idx} skipped — battery at safety floor "
             f"({args.deats_battery_min}%)"
         )
+
+        # Recharge the idle client so it can rejoin in a later round, instead
+        # of being lost permanently for the rest of training.
+        deats_scheduler.battery.recharge_idle(idx)
+
         wandb.log({
             f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
             f"Client{idx}_DroppedOut": 1,

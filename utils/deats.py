@@ -35,9 +35,19 @@ class DEATSConfig:
     score_energy_weight: float = 0.35
     score_fairness_weight: float = 0.35
     battery_min: float = 5.0
-    energy_scale: float = 0.03
+
+    # Recalibrated: was 0.03. Brings worst-case heaviest-tier drain to
+    # ~1.1%/round (vs ~8.4%), while keeping battery meaningfully dynamic.
+    energy_scale: float = 0.004
+
     battery_init_min: float = 65.0
     battery_init_max: float = 100.0
+
+    # Recharge/revive mechanism: a skipped (dead) client charges while idle,
+    # simulating a device being placed on a charger, so no client is lost
+    # permanently for the rest of training.
+    recharge_rate_per_skipped_round: float = 6.0
+    revive_margin: float = 10.0   # rejoins once battery >= battery_min + this
 
 
 @dataclass
@@ -49,6 +59,7 @@ class ClientEnergyState:
     cumulative_energy: float = 0.0
     tier_history: List[int] = field(default_factory=list)
     dropout: bool = False
+    rounds_skipped: int = 0
 
 
 class BatterySimulator:
@@ -82,8 +93,31 @@ class BatterySimulator:
         )
 
     def is_alive(self, client_id: int) -> bool:
-        """Whether the client can still participate."""
+        """Whether the client can currently participate."""
         return not self.clients[client_id].dropout
+
+    def recharge_idle(self, client_id: int) -> None:
+        """Charge a skipped (dead) client while idle; revive once above margin.
+
+        Called once per round for every client that was skipped this round.
+        Simulates the device being placed on a charger. Once it charges past
+        ``battery_min + revive_margin`` it automatically rejoins training, so
+        no client is excluded permanently.
+        """
+        state = self.clients[client_id]
+        if not state.dropout:
+            return
+        cfg = self.config
+        state.battery_percent = min(
+            100.0, state.battery_percent + cfg.recharge_rate_per_skipped_round
+        )
+        state.rounds_skipped += 1
+        if state.battery_percent >= cfg.battery_min + cfg.revive_margin:
+            state.dropout = False
+            print(
+                f"  [DEATS] Client {client_id} revived after charging: "
+                f"battery now {state.battery_percent:.1f}%"
+            )
 
     def drain(
         self,
@@ -189,10 +223,10 @@ class DEATSScheduler:
         """Estimated energy cost per round at tier m (Eq. 3.3)."""
         ema = self.battery.clients[client_id].ema_energy_rate
         if ema <= 0.0:
-            # Conservative bootstrap before first measurements arrive.
-            # A larger default avoids optimistic survivability estimates
-            # that can over-assign heavy tiers in early rounds.
-            ema = 2.0
+            # Bootstrap before first measurements arrive. Lowered to match
+            # the smaller recalibrated energy_scale so early-round survivability
+            # estimates are realistic rather than overly pessimistic.
+            ema = 0.3
         return ema * self.energy_ratio(code_tier)
 
     def survivable_rounds(self, client_id: int, code_tier: int) -> float:
@@ -244,11 +278,17 @@ class DEATSScheduler:
         scores: Dict[int, float] = {}
         metrics: Dict[str, Any] = {"battery": battery}
 
+        # Plan against a near-term horizon, re-evaluated every round, instead of
+        # the entire remaining campaign. Requiring survival for all ~299 rounds
+        # on round 1 forces every client into fallback and disables the scoring
+        # logic below. A rolling 30-round horizon is the standard approach.
+        lookahead = min(remaining_rounds, 30)
+
         for code_tier in candidates:
             if t_max is not None and time_estimates[code_tier] > t_max:
                 continue
 
-            if self.survivable_rounds(client_id, code_tier) < remaining_rounds:
+            if self.survivable_rounds(client_id, code_tier) < lookahead:
                 continue
 
             predicted_drain = self.round_energy(client_id, code_tier)
