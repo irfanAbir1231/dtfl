@@ -63,6 +63,9 @@ from utils.privacy import (
 
 from utils.TierScheduler import TierScheduler
 from utils.deats import DEATSConfig, DEATSScheduler
+
+# TITAN plan utilities (lr_schedule, fedprox_loss, ServerEMA)
+from utils.titan import lr_schedule, fedprox_loss, ServerEMA as TITANServerEMA
 from api.data_preprocessing.ham10000.data_loader import load_partition_data_ham10000
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
 from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
@@ -198,7 +201,54 @@ def add_args(parser):
                         help='Minimum initial battery %% for simulated clients')
     parser.add_argument('--deats_battery_init_max', type=float, default=100.0,
                         help='Maximum initial battery %% for simulated clients')
-    
+
+    # -----------------------------------------------------------------------
+    # TITAN plan arguments (Steps 2/3/5)
+    # All are off by default so the baseline behaviour is preserved when
+    # these flags are not passed. Recommended: --use_titan_lr --use_titan_ema
+    # --titan_fedprox 0.01
+    # -----------------------------------------------------------------------
+    parser.add_argument('--use_titan_lr', action='store_true', default=False,
+                        help='Enable TITAN warmup+cosine LR schedule (Step 2).')
+    parser.add_argument('--titan_warmup_rounds', type=int, default=10,
+                        help='Number of linear-warmup rounds for the LR schedule.')
+    parser.add_argument('--titan_min_lr_ratio', type=float, default=0.01,
+                        help='Final LR as a fraction of --lr (cosine floor).')
+
+    parser.add_argument('--titan_fedprox', type=float, default=0.0,
+                        help='FedProx proximal coefficient mu (0 disables; 0.01 is a safe default).')
+
+    parser.add_argument('--use_titan_ema', action='store_true', default=False,
+                        help='Enable server-side EMA of global weights (Step 5).')
+    parser.add_argument('--titan_ema_decay', type=float, default=0.9,
+                        help='EMA decay factor in (0,1); higher = smoother.')
+
+    # --- TITAN Steps 7, 9, 11 -----------------------------------------------
+    parser.add_argument('--use_titan_mixup', action='store_true', default=False,
+                        help='Enable MixUp/CutMix blending per batch (Step 7).')
+    parser.add_argument('--titan_mixup_alpha', type=float, default=0.2,
+                        help='Beta(alpha, alpha) for MixUp (0 disables).')
+    parser.add_argument('--titan_cutmix_prob', type=float, default=0.5,
+                        help='Probability of CutMix vs MixUp (rest is MixUp).')
+    parser.add_argument('--titan_cutmix_alpha', type=float, default=1.0,
+                        help='Beta(alpha, alpha) for CutMix (0 disables).')
+
+    parser.add_argument('--use_titan_gradclip', action='store_true', default=False,
+                        help='Clip gradients before optimizer.step() (Step 9).')
+    parser.add_argument('--titan_gradclip_max_norm', type=float, default=1.0,
+                        help='Max L2 norm for gradient clipping (<=0 disables).')
+
+    parser.add_argument('--use_titan_tta', action='store_true', default=False,
+                        help='Average predictions over augmented test views (Step 11).')
+    parser.add_argument('--titan_tta_views', type=int, default=4,
+                        help='Number of TTA views (1 disables averaging).')
+
+    parser.add_argument('--use_titan_aug', action='store_true', default=False,
+                        help='Use TITAN strong-augment pipeline for HAM10000 '
+                             'training images (Step 4: RandAugment + RandomErasing).')
+    parser.add_argument('--titan_aug_image_size', type=int, default=32,
+                        help='Image size used by the TITAN augmentation pipeline.')
+
     args = parser.parse_args()
     return args
 
@@ -390,6 +440,19 @@ else:
 client_cpus_gpus = [(0, 0.5, 0), (1, 0.5, 0), (2, 0, 1), (3, 2, 0), (4, 1, 0),
                     (5, 0.5, 0), (6, 0.5, 0), (7, 0, 1), (8, 2, 0), (9, 1, 0)]
 
+############### TITAN plan initialization (Steps 2/5) ###############
+# ServerEMA only initialised when --use_titan_ema is passed (default off so
+# the baseline behaviour is unchanged). fedprox uses args.titan_fedprox and
+# is wired inside Client.train().
+titan_server_ema = TITANServerEMA(decay=args.titan_ema_decay) if args.use_titan_ema else None
+if args.use_titan_ema:
+    print(f"TITAN server-side EMA enabled (decay={args.titan_ema_decay}).")
+if args.use_titan_lr:
+    print(f"TITAN warmup+cosine LR schedule enabled "
+          f"(warmup={args.titan_warmup_rounds}, min_ratio={args.titan_min_lr_ratio}).")
+if args.titan_fedprox > 0:
+    print(f"TITAN FedProx enabled (mu={args.titan_fedprox}).")
+
 
 
 
@@ -442,19 +505,31 @@ def load_data(args, dataset_name):
         train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
         class_num, traindata_cls_counts = data_loader(args.dataset, args.data_dir, args.partition_method,
                                 args.partition_alpha, args.client_number, args.batch_size)
-        
+
         dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
                    train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
-        
+
+    elif dataset_name == "ham10000":
+        # HAM10000 loader supports TITAN Step-4 strong augmentation
+        # (RandAugment + RandomErasing) via the strong_aug flag.
+        train_data_num, test_data_num, train_data_global, test_data_global, \
+        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+        class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
+                                args.partition_alpha, args.client_number, args.batch_size,
+                                strong_aug=getattr(args, "use_titan_aug", False))
+
+        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
+
     else:
         train_data_num, test_data_num, train_data_global, test_data_global, \
         train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
         class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
                                 args.partition_alpha, args.client_number, args.batch_size)
-        
+
         dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
                    train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
-    
+
     return dataset
 
 if args.dataset != "cinic10":
@@ -752,6 +827,17 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch, extracted
     net_server.train()
     # optimizer_server = torch.optim.Adam(net_server.parameters(), lr = lr)
     lr = new_lr
+    # TITAN Step 2 — warmup+cosine schedule overrides `new_lr` when enabled.
+    # Falls through unchanged when --use_titan_lr is not set, so baseline
+    # plateau-based scheduling still works exactly as before.
+    if args.use_titan_lr:
+        # `l_epoch_count` is the local epoch within the current round. The
+        # outer round index is `ell` here, so we look it up via the global
+        # `iter` we keep in main.py's round loop. Use args.rounds for total.
+        lr = lr_schedule(iter, args.rounds, base_lr=args.lr,
+                         warmup_rounds=args.titan_warmup_rounds,
+                         min_lr_ratio=args.titan_min_lr_ratio)
+        new_lr = lr  # propagate to the client side as well
     if args.optimizer == "Adam":
         optimizer_server =  torch.optim.Adam(net_server.parameters(), lr=lr, weight_decay=args.wd, amsgrad=True) # from fedgkt code
     elif args.optimizer == "SGD":
@@ -781,6 +867,9 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch, extracted
     #--------backward prop--------------
 
     loss.backward()  
+    if args.use_titan_gradclip:
+        from utils.titan import clip_gradients as _titan_clip
+        _titan_clip(net_server.parameters(), max_norm=args.titan_gradclip_max_norm)
     dfx_client = fx_client.grad.clone().detach()
     # dfx_client = fx_client.grad.clone().detach()
     optimizer_server.step()
@@ -1006,6 +1095,25 @@ class Client(object):
                 images, labels = images.to(self.device), labels.to(self.device)
                 optimizer_client.zero_grad()
 
+                # -----------------------------------------------------------
+                # TITAN Step 7 — MixUp / CutMix blending (client-side).
+                # We mix the input *and* the labels here, before the forward
+                # pass. Privacy/PatchShuffle then operate on the mixed image
+                # exactly as before. The mixed labels (a, b, lam) replace
+                # `labels` for the entire remainder of the batch.
+                # -----------------------------------------------------------
+                _mix_kind = "none"
+                if args.use_titan_mixup:
+                    from utils.titan import maybe_mix_batch as _titan_mix
+                    images, _lbl_a, _lbl_b, _lam, _mix_kind = _titan_mix(
+                        images, labels,
+                        alpha=max(args.titan_mixup_alpha, args.titan_cutmix_alpha),
+                        cutmix_prob=args.titan_cutmix_prob,
+                    )
+                    labels_a_mix, labels_b_mix, lam_mix = _lbl_a, _lbl_b, _lam
+                else:
+                    labels_a_mix, labels_b_mix, lam_mix = labels, labels, 1.0
+
                 #---------forward prop-------------
                 extracted_features, fx = net(images)
 
@@ -1066,7 +1174,13 @@ class Client(object):
                 time_s = time.time()
 
                 labels = labels.to(torch.long)
-                loss = criterion(extracted_features, labels) # to solve change dataset
+                labels_a_mix = labels_a_mix.to(torch.long)
+                labels_b_mix = labels_b_mix.to(torch.long)
+                if _mix_kind in ("mixup", "cutmix"):
+                    loss = lam_mix * criterion(extracted_features, labels_a_mix) + \
+                           (1.0 - lam_mix) * criterion(extracted_features, labels_b_mix)
+                else:
+                    loss = criterion(extracted_features, labels) # to solve change dataset
                 CEloss_client_train.append(((1 - dcor_coefficient)*loss.item()))
 
                 if whether_dcor:
@@ -1074,7 +1188,26 @@ class Client(object):
                     loss = (1 - dcor_coefficient) * loss + dcor_coefficient * Dcor_value
                     Dcorloss_client_train.append(((dcor_coefficient) * Dcor_value))
 
+                # TITAN Step 3 — FedProx proximal term.
+                # When --titan_fedprox 0 (default), this is a no-op (mu <= 0
+                # branch in fedprox_loss). When enabled, it keeps each local
+                # update close to the global anchor, reducing non-IID drift.
+                if args.titan_fedprox > 0.0:
+                    loss = fedprox_loss(
+                        local_params=dict(net.named_parameters()),
+                        global_params=w_glob_client_tier[client_tier[self.idx]],
+                        mu=args.titan_fedprox,
+                        base_loss=loss,
+                    )
+
                 loss.backward()
+
+                if args.use_titan_gradclip:
+                    from utils.titan import clip_gradients as _titan_clip_client
+                    _titan_clip_client(
+                        net.parameters(),
+                        max_norm=args.titan_gradclip_max_norm,
+                    )
 
                 optimizer_client.step()
                 time_client += time.time() - time_s
@@ -1138,7 +1271,14 @@ class Client(object):
             for batch_idx, (images, labels) in enumerate(self.ldr_test):
                 images, labels = images.to(self.device), labels.to(self.device)
                 #---------forward prop-------------
-                fx = net(images)
+                if args.use_titan_tta and args.titan_tta_views > 1:
+                    from utils.titan import tta_average_logits as _titan_tta
+                    probs = _titan_tta(net, images, n_views=args.titan_tta_views)
+                    # Reconstruct a fake "fx"-shaped logits via log so the
+                    # downstream criterion / accuracy still work the same way.
+                    fx = torch.log(probs + 1e-12)
+                else:
+                    fx = net(images)
                 labels = labels.to(torch.long)
                 loss = criterion(fx, labels)
                 acc = calculate_accuracy(fx, labels)
@@ -1542,7 +1682,15 @@ for iter in range(epochs):
     
             
     w_glob = aggregated_fedavg(w_locals_tier, w_locals_client, num_tiers, num_users, whether_local_loss, client_sample, idxs_users) # w_locals_tier is for server-side
-    
+
+    # TITAN Step 5 — server-side EMA of the aggregated global weights.
+    # When --use_titan_ema is set, w_glob is replaced with the smoothed EMA
+    # state. The raw average is still computed (above) so FedAvg semantics
+    # are preserved on every call; the EMA only changes what gets *broadcast*
+    # and *evaluated*. Falls through unchanged when EMA is disabled.
+    if titan_server_ema is not None:
+        w_glob = titan_server_ema.update(w_glob)
+
     for t in range(1, num_tiers+1):
         for k in w_glob_client_tier[t].keys():
             if k in w_glob_server_tier[t].keys():  # This is local updading  // another method can be updating and supoose its similar to global model

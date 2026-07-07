@@ -284,6 +284,11 @@ class DEATSScheduler:
         # logic below. A rolling 30-round horizon is the standard approach.
         lookahead = min(remaining_rounds, 30)
 
+        # TITAN Step 1 — compute scores for all feasible tiers (deep->shallow).
+        # Selection strategy: pick the *deepest affordable* tier among the
+        # top-K by score. This avoids the previous behaviour where shallow
+        # tiers always won (lower time/energy -> lower score -> always min),
+        # which capped training accuracy by starving clients of deep compute.
         for code_tier in candidates:
             if t_max is not None and time_estimates[code_tier] > t_max:
                 continue
@@ -311,13 +316,27 @@ class DEATSScheduler:
             selected = max(feasible) if feasible else self.num_tiers
             return selected, {**metrics, "reason": "survivability_fallback"}
 
-        selected = min(scores, key=scores.get)
+        # TITAN Step 1 — depth-first selection with fairness tiebreak.
+        # Sort feasible tiers deepest-first (smallest code_tier index = most
+        # local layers), then by score. This restores learning intensity:
+        # healthy clients are pushed to deeper tiers more often, while
+        # weak/low-battery clients still get a defensible shallow tier.
+        ranked = sorted(
+            scores.keys(), key=lambda m: (m, scores[m])
+        )  # tier asc (deepest first), then score asc
+        top_k = ranked[: max(1, min(3, len(ranked)))]
+        # Among the deepest-3 affordable tiers, pick the lowest-score one
+        # (preserves the original fairness+energy tradeoff).
+        best_in_top = min(top_k, key=lambda m: scores[m])
+        selected = best_in_top
+
         metrics.update(
             {
                 "selected_tier": selected,
                 "score": scores[selected],
                 "allowed_tiers": allowed,
                 "feasible_tiers": list(scores.keys()),
+                "depth_first_top_k": top_k,
             }
         )
         return selected, metrics
