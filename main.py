@@ -328,6 +328,11 @@ privacy_metrics      = args.privacy_metrics          # enable metric computation
 privacy_log_interval = args.privacy_log_interval     # log every N rounds
 # sigma_t is updated at the start of each round in the main loop
 sigma_t = noise_sigma0  # initialise to sigma_0
+
+if privacy_enable and privacy_metrics:
+    print("[Privacy] SNR and correlation-drop metrics enabled.")
+elif privacy_metrics:
+    print("[Privacy] SNR/correlation metrics requested, but privacy_enable=False; metrics will not be computed.")
 client_epoch = np.ones(args.client_number,dtype=int) * client_epoch
 
 client_type_percent = [0.0, 0.0, 0.0, 0.0, 1.0]
@@ -976,7 +981,7 @@ class Client(object):
             
         
 
-    def train(self, net):
+    def train(self, net, round_idx):
         net.train()
         self.lr , lr = new_lr, new_lr
 
@@ -999,7 +1004,7 @@ class Client(object):
         batch_snr_list       = []   # SNR values across batches
         batch_corr_drop_list = []   # correlation-drop values across batches
 
-        for iter in range(self.local_ep):
+        for local_epoch in range(self.local_ep):
             len_batch = len(self.ldr_train)
             for batch_idx, (images, labels) in enumerate(self.ldr_train):
                 time_s = time.time()
@@ -1060,7 +1065,7 @@ class Client(object):
                 # Sending activations to server and receiving gradients
                 # -----------------------------------------------------------
                 time_client += time.time() - time_s
-                dfx = train_server(client_fx, labels, iter, self.local_ep, self.idx, len_batch, _)
+                dfx = train_server(client_fx, labels, local_epoch, self.local_ep, self.idx, len_batch, _)
 
                 #--------backward prop -------------
                 time_s = time.time()
@@ -1089,23 +1094,35 @@ class Client(object):
         # W&B logging — client-level metrics
         # -------------------------------------------------------------------
         # Pre-existing decorrelation loss log
-        wandb.log({"Client{}_DcorLoss".format(self.idx): float(sum(Dcorloss_client_train)), "epoch": iter}, commit=False)
-        wandb.log({"Client{}_time_not_scaled (s)".format(self.idx): time_client, "epoch": iter}, commit=False)
+        wandb.log({"Client{}_DcorLoss".format(self.idx): float(sum(Dcorloss_client_train)), "epoch": round_idx}, commit=False)
+        wandb.log({"Client{}_time_not_scaled (s)".format(self.idx): time_client, "epoch": round_idx}, commit=False)
 
         # Privacy metrics: averaged over all batches in this training call
         # (privacy-implementation-plan.md §4, §5, §7)
         if privacy_enable and privacy_metrics:
+            avg_snr = None
+            avg_corr_drop = None
             if batch_snr_list:
                 avg_snr = sum(batch_snr_list) / len(batch_snr_list)
                 wandb.log(
-                    {"Privacy/SNR_client{}".format(self.idx): avg_snr, "epoch": iter},
+                    {"Privacy/SNR_client{}".format(self.idx): avg_snr, "epoch": round_idx},
                     commit=False,
                 )
             if batch_corr_drop_list:
                 avg_corr_drop = sum(batch_corr_drop_list) / len(batch_corr_drop_list)
                 wandb.log(
-                    {"Privacy/corr_drop_client{}".format(self.idx): avg_corr_drop, "epoch": iter},
+                    {"Privacy/corr_drop_client{}".format(self.idx): avg_corr_drop, "epoch": round_idx},
                     commit=False,
+                )
+            if avg_snr is not None and avg_corr_drop is not None:
+                print(
+                    f"[Privacy] Round {round_idx:3d} | Client {self.idx:2d} | "
+                    f"SNR={avg_snr:.6f} | corr_drop={avg_corr_drop:.6f}"
+                )
+            elif not batch_snr_list and not batch_corr_drop_list:
+                print(
+                    f"[Privacy] Round {round_idx:3d} | Client {self.idx:2d} | "
+                    "SNR/corr_drop unavailable: no privacy metric batches were collected."
                 )
 
         return net.state_dict(), time_client, client_intermediate_data_size
@@ -1401,7 +1418,10 @@ for iter in range(epochs):
             
 
         # Training ------------------
-        [w_client, duration, client_intermediate_data_size] = local.train(net = copy.deepcopy(net_glob_client).to(device))
+        [w_client, duration, client_intermediate_data_size] = local.train(
+            net=copy.deepcopy(net_glob_client).to(device),
+            round_idx=iter,
+        )
             
         w_locals_client.append(copy.deepcopy(w_client))
         w_locals_client_tier[client_tier[idx]].append(copy.deepcopy(w_client))
