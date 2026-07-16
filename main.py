@@ -128,7 +128,7 @@ def add_args(parser):
                         help='number of workers in a distributed cluster')
     parser.add_argument('--batch_size', type=int, default=100, metavar='N',
                         help='input batch size for training (default: 64)')
-    parser.add_argument('--rounds', default=300, type=int)
+    parser.add_argument('--rounds', default=250, type=int)
     parser.add_argument('--whether_local_loss', default=True, type=bool)
     parser.add_argument('--tier', default=5, type=int)
         
@@ -743,226 +743,187 @@ new_lr = lr
 min_lr = args.lr_min
 
 times_in_server = []
-        
-        
-# Server-side function associated with Training 
-def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch, extracted_features):
+
+
+# Server-side function associated with Training
+def train_server(fx_client, y, round_idx, l_epoch_count, l_epoch, idx, len_batch, extracted_features):
     global net_model_server, criterion, optimizer_server, device, batch_acc_train, batch_loss_train, l_epoch_check, fed_check
     global loss_train_collect, acc_train_collect, count1, acc_avg_all_user_train, loss_avg_all_user_train, idx_collect, w_locals_server, w_glob_server, net_server, time_train_server_train, time_train_server_train_all, w_glob_server_tier, w_locals_server_tier, w_locals_tier
     global loss_train_collect_user, acc_train_collect_user, lr, total_time, times_in_server, new_lr
-    time_train_server_s = time.time()
-    
+
     net_server = copy.deepcopy(net_model_server_tier[idx]).to(device)
-    
     net_server.train()
-    # optimizer_server = torch.optim.Adam(net_server.parameters(), lr = lr)
+
     lr = new_lr
     if args.optimizer == "Adam":
-        optimizer_server =  torch.optim.Adam(net_server.parameters(), lr=lr, weight_decay=args.wd, amsgrad=True) # from fedgkt code
+        optimizer_server = torch.optim.Adam(net_server.parameters(), lr=lr, weight_decay=args.wd, amsgrad=True)
     elif args.optimizer == "SGD":
-        optimizer_server =  torch.optim.SGD(net_server.parameters(), lr=lr, momentum=0.9,
-                                              nesterov=True,
-                                              weight_decay=args.wd)
-    
+        optimizer_server = torch.optim.SGD(
+            net_server.parameters(),
+            lr=lr,
+            momentum=0.9,
+            nesterov=True,
+            weight_decay=args.wd,
+        )
+
     time_train_server_s = time.time()
-    # train and update
     optimizer_server.zero_grad()
-    
+
     fx_client = fx_client.to(device)
     y = y.to(device)
-    
-    #---------forward prop-------------
-    fx_server = net_server(fx_client)
-    
-    # calculate loss
-    y = y.to(torch.long)
-    # y.int()
-    loss = criterion(fx_server, y) # to solve change dataset
-    
-                    
-    # calculate accuracy
-    acc = calculate_accuracy(fx_server, y)
-    
-    #--------backward prop--------------
 
-    loss.backward()  
+    fx_server = net_server(fx_client)
+    y = y.to(torch.long)
+    loss = criterion(fx_server, y)
+    acc = calculate_accuracy(fx_server, y)
+
+    loss.backward()
     dfx_client = fx_client.grad.clone().detach()
-    # dfx_client = fx_client.grad.clone().detach()
     optimizer_server.step()
+
     batch_loss_train.append(loss.item())
     batch_acc_train.append(acc.item())
-    # scheduler_server.step(best_acc)#, epoch=l_epoch_count) #from fedgkt
-    
-    # Update the server-side model for the current batch
+
     net_model_server[idx] = copy.deepcopy(net_server)
     net_model_server_tier[idx] = copy.deepcopy(net_server)
     time_train_server_train += time.time() - time_train_server_s
-    # count1: to track the completion of the local batch associated with one client
-    # like count1 , aggregate time_train_server_train
+
     count1 += 1
     if count1 == len_batch:
-        acc_avg_train = sum(batch_acc_train)/len(batch_acc_train)           # it has accuracy for one batch
-        loss_avg_train = sum(batch_loss_train)/len(batch_loss_train)
-        
+        acc_avg_train = sum(batch_acc_train) / len(batch_acc_train)
+        loss_avg_train = sum(batch_loss_train) / len(batch_loss_train)
+
         batch_acc_train = []
         batch_loss_train = []
         count1 = 0
-        
-        # wandb.log({"Client{}_Training_Time_in_Server".format(idx): time_train_server_train, "epoch": l_epoch_count}, commit=False)
+
         times_in_server.append(time_train_server_train)
         time_train_server_train_all += time_train_server_train
         total_time += time_train_server_train
         time_train_server_train = 0
-        
-        prRed('Client{} Train => Local Epoch: {} \tAcc: {:.2f} \tLoss: {:.3f}'.format(idx, l_epoch_count, acc_avg_train, loss_avg_train))
-        
-        # copy the last trained model in the batch       
-        w_server = net_server.state_dict()      
-        
-        # If one local epoch is completed, after this a new client will come
-        if l_epoch_count == l_epoch-1:
-            
-            l_epoch_check = True                # to evaluate_server function - to check local epoch has completed or not 
+
+        prRed('Client{} Train => Local Epoch: {} \tAcc: {:.2f} \tLoss: {:.3f}'.format(
+            idx, l_epoch_count, acc_avg_train, loss_avg_train
+        ))
+
+        w_server = net_server.state_dict()
+
+        if l_epoch_count == l_epoch - 1:
+            l_epoch_check = True
             w_locals_server.append(copy.deepcopy(w_server))
             w_locals_server_tier[client_tier[idx]].append(copy.deepcopy(w_server))
-            
-            acc_avg_train_all = acc_avg_train
-            loss_avg_train_all = loss_avg_train
-                        
-            # accumulate accuracy and loss for each new user
-            loss_train_collect_user.append(loss_avg_train_all)
-            acc_train_collect_user.append(acc_avg_train_all)
-            
-            # collect the id of each new user                        
+
+            loss_train_collect_user.append(loss_avg_train)
+            acc_train_collect_user.append(acc_avg_train)
+
             if idx not in idx_collect:
-                idx_collect.append(idx) 
-            
-        # This is for federation process--------------------
-        # if len(idx_collect) == num_users:
-        if len(idx_collect) == m:  # federation after evfery epoch not when all clients complete thier process like splitfed
-            fed_check = True 
-                                                             # to evaluate_server function  - to check fed check has hitted
-            # Federation process at Server-Side------------------------- output print and update is done in evaluate_server()
-            # for nicer display 
+                idx_collect.append(idx)
+
+        if len(idx_collect) == m:
+            fed_check = True
             w_locals_tier = w_locals_server
             w_locals_server = []
             w_locals_server_tier = {}
-            for i in range(1,num_tiers+1):
-                w_locals_server_tier[i]=[]
+            for i in range(1, num_tiers + 1):
+                w_locals_server_tier[i] = []
             idx_collect = []
-            
-            acc_avg_all_user_train = sum(acc_train_collect_user)/len(acc_train_collect_user)
-            loss_avg_all_user_train = sum(loss_train_collect_user)/len(loss_train_collect_user)
-            
+
+            acc_avg_all_user_train = sum(acc_train_collect_user) / len(acc_train_collect_user)
+            loss_avg_all_user_train = sum(loss_train_collect_user) / len(loss_train_collect_user)
+
             loss_train_collect.append(loss_avg_all_user_train)
             acc_train_collect.append(acc_avg_all_user_train)
-            
+
             acc_train_collect_user = []
             loss_train_collect_user = []
-            
-            wandb.log({"Server_Training_Time": time_train_server_train_all, "epoch": l_epoch_count}, commit=False)
-            print("Server LR: ", optimizer_server.param_groups[0]['lr'])
-            new_lr = optimizer_server.param_groups[0]['lr']
-            wandb.log({"Server_LR": optimizer_server.param_groups[0]['lr'], "epoch": l_epoch_count}, commit=False)
-            
-    
-    # print(time_train_server_copy, time_train_server_train)
-    # send gradients to the client               
-    # return dfx_client
-    return dfx_client  # output of server 
 
-# Server-side functions associated with Testing
-def evaluate_server(fx_client, y, idx, len_batch, ell):
-    global net_model_server, criterion, batch_acc_test, batch_loss_test, check_fed, net_server, net_glob_server, net_glob_server_tier 
-    global loss_test_collect, acc_test_collect, count2, num_users, acc_avg_train_all, loss_avg_train_all, w_glob_server, l_epoch_check, fed_check, w_glob_server_tier
-    global loss_test_collect_user, acc_test_collect_user, acc_avg_all_user_train, acc_avg_all_user, loss_avg_all_user_train, best_acc
-    global wait, new_lr
-    
-    net = copy.deepcopy(net_model_server_tier[idx]).to(device)
-    net.eval()
-  
+            wandb.log({"Server_Training_Time": time_train_server_train_all, "epoch": round_idx}, commit=False)
+            print("Server LR: ", optimizer_server.param_groups[0]["lr"])
+            new_lr = optimizer_server.param_groups[0]["lr"]
+            wandb.log({"Server_LR": optimizer_server.param_groups[0]["lr"], "epoch": round_idx}, commit=False)
+
+    return dfx_client
+
+
+def evaluate_global_split_model(client_net, server_net, test_loader, round_idx, eval_tier):
+    """Evaluate the aggregated global split model once per FL round."""
+    global loss_test_collect, acc_test_collect, acc_avg_all_user_train, loss_avg_all_user_train
+    global best_acc, wait, new_lr, fed_check, l_epoch_check
+
+    client_eval = copy.deepcopy(client_net).to(device)
+    server_eval = copy.deepcopy(server_net).to(device)
+    client_eval.eval()
+    server_eval.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
     with torch.no_grad():
-        fx_client = fx_client.to(device)
-        y = y.to(device) 
-        #---------forward prop-------------
-        fx_server = net(fx_client)
-        
-        # calculate loss
-        y = y.to(torch.long)
-        loss = criterion(fx_server, y)
-        acc = calculate_accuracy(fx_server, y)
-        
-        
-        batch_loss_test.append(loss.item())
-        batch_acc_test.append(acc.item())
-        
-    
-        count2 += 1
-        if count2 == len_batch:
-            acc_avg_test = sum(batch_acc_test)/len(batch_acc_test)
-            loss_avg_test = sum(batch_loss_test)/len(batch_loss_test)
-            
-            batch_acc_test = []
-            batch_loss_test = []
-            count2 = 0
-            
-            prGreen('Global Model Test =>                   \tAcc: {:.3f} \tLoss: {:.4f}'.format(acc_avg_test, loss_avg_test))
-            wandb.log({"Client{}_Test_Accuracy".format(idx): acc_avg_test, "epoch": 22}, commit=False)
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device).long()
 
-            if loss_avg_test > 100:
-                print(loss_avg_test)
-            # if a local epoch is completed   
-            if l_epoch_check:
-                l_epoch_check = False
-                
-                # Store the last accuracy and loss
-                acc_avg_test_all = acc_avg_test
-                loss_avg_test_all = loss_avg_test
-                        
-                loss_test_collect_user.append(loss_avg_test_all)
-                acc_test_collect_user.append(acc_avg_test_all)
-                
-            # if federation is happened----------                    
-            if fed_check:
-                fed_check = False
-                print("------------------------------------------------")
-                print("------ Federation process at Server-Side ------- ")
-                print("------------------------------------------------")
-                
-                acc_avg_all_user = sum(acc_test_collect_user)/len(acc_test_collect_user)
-                loss_avg_all_user = sum(loss_test_collect_user)/len(loss_test_collect_user)
-            
-                loss_test_collect.append(loss_avg_all_user)
-                acc_test_collect.append(acc_avg_all_user)
-                acc_test_collect_user = []
-                loss_test_collect_user= []
-                
-                
-                if (acc_avg_all_user/100) > best_acc  * ( 1 + DYNAMIC_LR_THRESHOLD ):
-                    print("- Found better accuracy")
-                    best_acc = (acc_avg_all_user/100)
-                    wait = 0
-                else:
-                     wait += 1 
-                     print('wait', wait)
-                if wait > patience:   #https://github.com/Jiaming-Liu/pytorch-lr-scheduler/blob/master/lr_scheduler.py
-                    new_lr = max(float(optimizer_server.param_groups[0]['lr']) * factor, min_lr)
-                    wait = 0
-                    
-                    
-                              
-                print("==========================================================")
-                print("{:^58}".format("DTFL Performance"))
-                print("----------------------------------------------------------")
-                print(' Train: Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}'.format(ell, acc_avg_all_user_train, loss_avg_all_user_train))
-                print(' Test:  Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}'.format(ell, acc_avg_all_user, loss_avg_all_user))
-                print("==========================================================")
-                
-                wandb.log({"Server_Training_Accuracy": acc_avg_all_user_train, "epoch": ell}, commit=False)
-                wandb.log({"Server_Test_Accuracy": acc_avg_all_user, "epoch": ell}, commit=False)
+            client_output = client_eval(images)
+            if isinstance(client_output, tuple):
+                _, fx = client_output
+            else:
+                fx = client_output
 
-         
-    return 
+            logits = server_eval(fx.to(device))
+            loss = criterion(logits, labels)
+            batch_size = labels.size(0)
+
+            total_loss += loss.item() * batch_size
+            total_correct += logits.argmax(dim=1).eq(labels).sum().item()
+            total_samples += batch_size
+
+    if total_samples == 0:
+        raise RuntimeError("Global evaluation received an empty test loader.")
+
+    loss_avg_all_user = total_loss / total_samples
+    acc_avg_all_user = 100.0 * total_correct / total_samples
+
+    loss_test_collect.append(loss_avg_all_user)
+    acc_test_collect.append(acc_avg_all_user)
+
+    if (acc_avg_all_user / 100) > best_acc * (1 + DYNAMIC_LR_THRESHOLD):
+        print("- Found better accuracy")
+        best_acc = acc_avg_all_user / 100
+        wait = 0
+    else:
+        wait += 1
+        print("wait", wait)
+
+    if wait > patience:
+        new_lr = max(float(new_lr) * factor, min_lr)
+        wait = 0
+
+    fed_check = False
+    l_epoch_check = False
+
+    print("==========================================================")
+    print("{:^58}".format("DTFL Performance"))
+    print("----------------------------------------------------------")
+    print(" Eval Tier: {:3d}".format(eval_tier))
+    print(" Train: Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}".format(
+        round_idx, acc_avg_all_user_train, loss_avg_all_user_train
+    ))
+    print(" Test:  Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}".format(
+        round_idx, acc_avg_all_user, loss_avg_all_user
+    ))
+    print("==========================================================")
+
+    wandb.log({
+        "Server_Training_Accuracy": acc_avg_all_user_train,
+        "Server_Test_Accuracy": acc_avg_all_user,
+        "Server_Test_Loss": loss_avg_all_user,
+        "Global_Eval_Tier": eval_tier,
+        "epoch": round_idx,
+    }, commit=False)
+
+    return loss_avg_all_user, acc_avg_all_user
+
 
 #==============================================================================================================
 #                                       Clients-side Program
@@ -1065,7 +1026,7 @@ class Client(object):
                 # Sending activations to server and receiving gradients
                 # -----------------------------------------------------------
                 time_client += time.time() - time_s
-                dfx = train_server(client_fx, labels, local_epoch, self.local_ep, self.idx, len_batch, _)
+                dfx = train_server(client_fx, labels, round_idx, local_epoch, self.local_ep, self.idx, len_batch, _)
 
                 #--------backward prop -------------
                 time_s = time.time()
@@ -1127,23 +1088,6 @@ class Client(object):
 
         return net.state_dict(), time_client, client_intermediate_data_size
     
-    def evaluate(self, net, ell):
-        net.eval()
-
-           
-        with torch.no_grad():
-            len_batch = len(self.ldr_test)
-            for batch_idx, (images, labels) in enumerate(self.ldr_test):
-                images, labels = images.to(self.device), labels.to(self.device)
-                #---------forward prop-------------
-
-                extracted_features, fx = net(images)
-            # Sending activations to server 
-                evaluate_server(fx, labels, self.idx, len_batch, ell)
-
-                
-        return 
-
     def evaluate_glob(self, net, ell): # I wrote this part
         net.eval()
         epoch_acc = []
@@ -1426,18 +1370,6 @@ for iter in range(epochs):
         w_locals_client.append(copy.deepcopy(w_client))
         w_locals_client_tier[client_tier[idx]].append(copy.deepcopy(w_client))
         
-        # Testing -------------------
-        # Use the last *active* client so evaluation still runs when the
-        # originally-sampled last client has dropped out (DEATS).
-        if idx == active_idxs_users[-1]:
-            net = copy.deepcopy(net_glob_client)
-            w_previous = copy.deepcopy(net.state_dict())  # to test for updated model
-            net.load_state_dict(w_client)
-            net.to(device)
-            
-            local.evaluate(net, ell= iter)
-            net.load_state_dict(w_previous) # to return to previous state for other clients
-            
         client_observed_time[idx] = duration
         
         
@@ -1578,6 +1510,15 @@ for iter in range(epochs):
             
         net_glob_client_tier[t].load_state_dict(w_glob_client_tier[t])
         net_glob_server_tier[t].load_state_dict(w_glob_server_tier[t])
+
+    global_eval_tier = num_tiers
+    evaluate_global_split_model(
+        net_glob_client_tier[global_eval_tier],
+        net_glob_server_tier[global_eval_tier],
+        test_data_global,
+        iter,
+        global_eval_tier,
+    )
  
 
     
