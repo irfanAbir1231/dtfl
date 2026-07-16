@@ -131,6 +131,24 @@ def add_args(parser):
     parser.add_argument('--rounds', default=250, type=int)
     parser.add_argument('--whether_local_loss', default=True, type=bool)
     parser.add_argument('--tier', default=5, type=int)
+    parser.add_argument(
+        '--bn_recalibrate',
+        action='store_true',
+        default=True,
+        help='Recompute BatchNorm running statistics after FedAvg and before server testing.',
+    )
+    parser.add_argument(
+        '--no_bn_recalibrate',
+        dest='bn_recalibrate',
+        action='store_false',
+        help='Disable post-FedAvg BatchNorm recalibration.',
+    )
+    parser.add_argument(
+        '--bn_recalibration_batches',
+        default=0,
+        type=int,
+        help='Number of global training batches for BN recalibration; 0 uses the full train loader.',
+    )
         
     
     # Decorrelation / obfuscation arguments (pre-existing)
@@ -925,6 +943,81 @@ def evaluate_global_split_model(client_net, server_net, test_loader, round_idx, 
     return loss_avg_all_user, acc_avg_all_user
 
 
+def recalibrate_batchnorm_split_model(client_net, server_net, train_loader, round_idx, eval_tier, max_batches=0):
+    """Refresh BatchNorm running stats on training data without updating weights."""
+    if max_batches is not None and max_batches < 0:
+        raise ValueError("--bn_recalibration_batches must be >= 0.")
+
+    bn_modules = [
+        module
+        for module in list(client_net.modules()) + list(server_net.modules())
+        if isinstance(module, nn.modules.batchnorm._BatchNorm)
+    ]
+    if not bn_modules:
+        wandb.log({
+            "BN_Recalibration_Batches": 0,
+            "BN_Recalibration_Samples": 0,
+            "Global_Eval_Tier": eval_tier,
+            "epoch": round_idx,
+        }, commit=False)
+        return 0, 0
+
+    client_was_training = client_net.training
+    server_was_training = server_net.training
+    original_momentum = {module: module.momentum for module in bn_modules}
+
+    for module in bn_modules:
+        module.reset_running_stats()
+        module.momentum = None
+
+    client_net.train()
+    server_net.train()
+
+    batches_seen = 0
+    samples_seen = 0
+    with torch.no_grad():
+        for images, _ in train_loader:
+            if max_batches and batches_seen >= max_batches:
+                break
+
+            images = images.to(device)
+            client_output = client_net(images)
+            if isinstance(client_output, tuple):
+                _, fx = client_output
+            else:
+                fx = client_output
+
+            server_net(fx.to(device))
+            batches_seen += 1
+            samples_seen += images.size(0)
+
+    for module, momentum in original_momentum.items():
+        module.momentum = momentum
+
+    if client_was_training:
+        client_net.train()
+    else:
+        client_net.eval()
+
+    if server_was_training:
+        server_net.train()
+    else:
+        server_net.eval()
+
+    print(
+        f"BN recalibration => Tier {eval_tier}, "
+        f"Batches: {batches_seen}, Samples: {samples_seen}"
+    )
+    wandb.log({
+        "BN_Recalibration_Batches": batches_seen,
+        "BN_Recalibration_Samples": samples_seen,
+        "Global_Eval_Tier": eval_tier,
+        "epoch": round_idx,
+    }, commit=False)
+
+    return batches_seen, samples_seen
+
+
 #==============================================================================================================
 #                                       Clients-side Program
 #==============================================================================================================
@@ -1512,6 +1605,18 @@ for iter in range(epochs):
         net_glob_server_tier[t].load_state_dict(w_glob_server_tier[t])
 
     global_eval_tier = num_tiers
+    if args.bn_recalibrate:
+        recalibrate_batchnorm_split_model(
+            net_glob_client_tier[global_eval_tier],
+            net_glob_server_tier[global_eval_tier],
+            train_data_global,
+            iter,
+            global_eval_tier,
+            max_batches=args.bn_recalibration_batches,
+        )
+        w_glob_client_tier[global_eval_tier] = net_glob_client_tier[global_eval_tier].state_dict()
+        w_glob_server_tier[global_eval_tier] = net_glob_server_tier[global_eval_tier].state_dict()
+
     evaluate_global_split_model(
         net_glob_client_tier[global_eval_tier],
         net_glob_server_tier[global_eval_tier],
