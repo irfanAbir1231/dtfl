@@ -128,7 +128,7 @@ def add_args(parser):
                         help='number of workers in a distributed cluster')
     parser.add_argument('--batch_size', type=int, default=100, metavar='N',
                         help='input batch size for training (default: 64)')
-    parser.add_argument('--rounds', default=300, type=int)
+    parser.add_argument('--rounds', default=250, type=int)
     parser.add_argument('--whether_local_loss', default=True, type=bool)
     parser.add_argument('--tier', default=5, type=int)
         
