@@ -346,6 +346,13 @@ privacy_metrics      = args.privacy_metrics          # enable metric computation
 privacy_log_interval = args.privacy_log_interval     # log every N rounds
 # sigma_t is updated at the start of each round in the main loop
 sigma_t = noise_sigma0  # initialise to sigma_0
+privacy_total_signal_power = 0.0
+privacy_total_noise_power = 0.0
+privacy_total_snr_batches = 0
+privacy_corr_drop_sum = 0.0
+privacy_corr_drop_count = 0
+privacy_client_round_snr_values = []
+privacy_client_round_corr_drop_values = []
 
 if privacy_enable and privacy_metrics:
     print("[Privacy] SNR and correlation-drop metrics enabled.")
@@ -1036,6 +1043,11 @@ class Client(object):
         
 
     def train(self, net, round_idx):
+        global privacy_total_signal_power, privacy_total_noise_power
+        global privacy_total_snr_batches, privacy_corr_drop_sum
+        global privacy_corr_drop_count, privacy_client_round_snr_values
+        global privacy_client_round_corr_drop_values
+
         net.train()
         self.lr , lr = new_lr, new_lr
 
@@ -1104,12 +1116,19 @@ class Client(object):
                         # §4  SNR: signal power / noise power
                         snr_val = compute_snr(fx_clipped, fx_noisy)
                         batch_snr_list.append(snr_val)
+                        signal_power = fx_clipped.detach().pow(2).sum().item()
+                        noise_power = (fx_noisy.detach() - fx_clipped.detach()).pow(2).sum().item()
+                        privacy_total_signal_power += signal_power
+                        privacy_total_noise_power += noise_power
+                        privacy_total_snr_batches += 1
 
                         # §5  Correlation drop: relative dCor reduction
                         corr_drop_val = compute_corr_drop(
                             images, fx_clipped, fx_noisy
                         )
                         batch_corr_drop_list.append(corr_drop_val)
+                        privacy_corr_drop_sum += corr_drop_val
+                        privacy_corr_drop_count += 1
                 else:
                     # Privacy disabled: send the (possibly shuffled) tensor
                     # unchanged — identical to the original behaviour.
@@ -1158,12 +1177,14 @@ class Client(object):
             avg_corr_drop = None
             if batch_snr_list:
                 avg_snr = sum(batch_snr_list) / len(batch_snr_list)
+                privacy_client_round_snr_values.append(avg_snr)
                 wandb.log(
                     {"Privacy/SNR_client{}".format(self.idx): avg_snr, "epoch": round_idx},
                     commit=False,
                 )
             if batch_corr_drop_list:
                 avg_corr_drop = sum(batch_corr_drop_list) / len(batch_corr_drop_list)
+                privacy_client_round_corr_drop_values.append(avg_corr_drop)
                 wandb.log(
                     {"Privacy/corr_drop_client{}".format(self.idx): avg_corr_drop, "epoch": round_idx},
                     commit=False,
@@ -1635,10 +1656,53 @@ for iter in range(epochs):
     
     
 elapsed = (time.time() - start_time)/60
-    
-#===================================================================================     
 
-print("Training and Evaluation completed!")    
+if privacy_enable and privacy_metrics:
+    if privacy_total_snr_batches > 0 and privacy_total_noise_power > 0:
+        overall_snr = privacy_total_signal_power / privacy_total_noise_power
+        overall_snr_db = 10.0 * math.log10(overall_snr) if overall_snr > 0 else float("-inf")
+        overall_corr_drop = (
+            privacy_corr_drop_sum / privacy_corr_drop_count
+            if privacy_corr_drop_count > 0
+            else float("nan")
+        )
+        client_round_snr = (
+            sum(privacy_client_round_snr_values) / len(privacy_client_round_snr_values)
+            if privacy_client_round_snr_values
+            else float("nan")
+        )
+        client_round_corr_drop = (
+            sum(privacy_client_round_corr_drop_values) / len(privacy_client_round_corr_drop_values)
+            if privacy_client_round_corr_drop_values
+            else float("nan")
+        )
+
+        print("==========================================================")
+        print("{:^58}".format("Overall Privacy Metrics"))
+        print("----------------------------------------------------------")
+        print(f" Overall SNR:                 {overall_snr:.9f}")
+        print(f" Overall SNR (dB):            {overall_snr_db:.3f}")
+        print(f" Overall correlation drop:    {overall_corr_drop:.6f}")
+        print(f" Protected batches counted:   {privacy_total_snr_batches}")
+        print(f" Client-round mean SNR:       {client_round_snr:.9f}")
+        print(f" Client-round mean corr_drop: {client_round_corr_drop:.6f}")
+        print("==========================================================")
+
+        wandb.log({
+            "Privacy/Overall_SNR": overall_snr,
+            "Privacy/Overall_SNR_dB": overall_snr_db,
+            "Privacy/Overall_Corr_Drop": overall_corr_drop,
+            "Privacy/Protected_Batches": privacy_total_snr_batches,
+            "Privacy/ClientRound_Mean_SNR": client_round_snr,
+            "Privacy/ClientRound_Mean_Corr_Drop": client_round_corr_drop,
+            "epoch": epochs,
+        }, commit=True)
+    else:
+        print("[Privacy] Overall SNR/correlation summary unavailable: no protected batches were collected.")
+
+#===================================================================================
+
+print("Training and Evaluation completed!")
     
 
 #=============================================================================
