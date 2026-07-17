@@ -18,12 +18,22 @@ from __future__ import annotations
 
 import math
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_RDP_ORDERS = (
+    1.25,
+    1.5,
+    1.75,
+    *range(2, 65),
+    128,
+    256,
+    512,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Adaptive noise schedule
@@ -182,7 +192,70 @@ def compute_corr_drop(
 
 
 # ---------------------------------------------------------------------------
-# 6. Optional (ε, δ)-DP accounting via Opacus
+# 6. Formal cumulative RDP accountant for smashed-feature Gaussian releases
+# ---------------------------------------------------------------------------
+
+def gaussian_mechanism_rdp(
+    noise_multiplier: float,
+    orders: Sequence[float] = DEFAULT_RDP_ORDERS,
+    sensitivity_multiplier: float = 2.0,
+) -> list[float]:
+    """Return per-order RDP cost for one Gaussian smashed-feature release.
+
+    The released tensor is clipped to L2 norm ``clip_C`` and perturbed with
+    Gaussian noise whose standard deviation is ``noise_multiplier * clip_C``.
+    For replace-one adjacency, two clipped feature vectors can differ by up to
+    ``2 * clip_C``; therefore the default ``sensitivity_multiplier`` is 2.0.
+    Use 1.0 only when writing the paper under add/remove adjacency.
+
+    This is a conservative no-subsampling accountant. It composes over adaptive
+    releases by summing RDP values for every protected batch.
+    """
+    if noise_multiplier <= 0:
+        raise ValueError("noise_multiplier must be positive for DP accounting.")
+    if sensitivity_multiplier <= 0:
+        raise ValueError("sensitivity_multiplier must be positive.")
+
+    effective_noise = noise_multiplier / sensitivity_multiplier
+    return [float(order) / (2.0 * effective_noise * effective_noise) for order in orders]
+
+
+def compose_rdp(
+    current_rdp: Sequence[float],
+    added_rdp: Sequence[float],
+) -> list[float]:
+    """Compose RDP costs by summing them order-wise."""
+    if len(current_rdp) != len(added_rdp):
+        raise ValueError("RDP vectors must have the same length.")
+    return [float(a) + float(b) for a, b in zip(current_rdp, added_rdp)]
+
+
+def get_privacy_spent_from_rdp(
+    orders: Sequence[float],
+    rdp: Sequence[float],
+    delta: float,
+) -> tuple[float, float]:
+    """Convert cumulative RDP values to an ``(epsilon, delta)`` DP guarantee."""
+    if not 0 < delta < 1:
+        raise ValueError("delta must be in (0, 1).")
+    if len(orders) != len(rdp):
+        raise ValueError("orders and rdp must have the same length.")
+
+    epsilons = [
+        float(rdp_value) + math.log(1.0 / delta) / (float(order) - 1.0)
+        for order, rdp_value in zip(orders, rdp)
+        if float(order) > 1.0
+    ]
+    valid_orders = [float(order) for order in orders if float(order) > 1.0]
+    if not epsilons:
+        raise ValueError("at least one RDP order greater than 1 is required.")
+
+    best_idx = min(range(len(epsilons)), key=epsilons.__getitem__)
+    return float(epsilons[best_idx]), float(valid_orders[best_idx])
+
+
+# ---------------------------------------------------------------------------
+# 7. Optional per-round (ε, δ)-DP accounting via Opacus
 # ---------------------------------------------------------------------------
 
 def get_dp_epsilon(

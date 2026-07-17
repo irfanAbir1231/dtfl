@@ -58,6 +58,10 @@ from utils.privacy import (
     add_gaussian_noise,
     compute_snr,
     compute_corr_drop,
+    DEFAULT_RDP_ORDERS,
+    compose_rdp,
+    gaussian_mechanism_rdp,
+    get_privacy_spent_from_rdp,
     get_dp_epsilon,
 )
 
@@ -178,6 +182,24 @@ def add_args(parser):
     # Target delta for (epsilon, delta)-DP accounting
     parser.add_argument('--privacy_delta', default=1e-5, type=float,
                         help='Target delta for (eps, delta)-DP accounting via opacus.')
+    parser.add_argument(
+        '--dp_accountant',
+        action='store_true',
+        default=True,
+        help='Enable built-in cumulative RDP accounting for noisy smashed-feature releases.',
+    )
+    parser.add_argument(
+        '--no_dp_accountant',
+        dest='dp_accountant',
+        action='store_false',
+        help='Disable built-in cumulative RDP accounting.',
+    )
+    parser.add_argument(
+        '--dp_sensitivity_multiplier',
+        default=2.0,
+        type=float,
+        help='Sensitivity multiplier for DP accounting: 2.0 for replace-one adjacency, 1.0 for add/remove adjacency.',
+    )
     # Enable computation and logging of SNR and correlation-drop metrics
     parser.add_argument('--privacy_metrics', default=True, type=bool,
                         help='Compute and log SNR and correlation-drop privacy metrics to W&B.')
@@ -344,6 +366,8 @@ noise_decay          = args.noise_decay              # per-round decay factor
 privacy_delta        = args.privacy_delta            # δ for (ε, δ)-DP
 privacy_metrics      = args.privacy_metrics          # enable metric computation
 privacy_log_interval = args.privacy_log_interval     # log every N rounds
+dp_accountant        = args.dp_accountant            # cumulative RDP accountant
+dp_sensitivity_multiplier = args.dp_sensitivity_multiplier
 # sigma_t is updated at the start of each round in the main loop
 sigma_t = noise_sigma0  # initialise to sigma_0
 privacy_total_signal_power = 0.0
@@ -353,11 +377,22 @@ privacy_corr_drop_sum = 0.0
 privacy_corr_drop_count = 0
 privacy_client_round_snr_values = []
 privacy_client_round_corr_drop_values = []
+privacy_rdp_orders = tuple(float(order) for order in DEFAULT_RDP_ORDERS)
+privacy_cumulative_rdp = [0.0 for _ in privacy_rdp_orders]
+privacy_dp_protected_batches = 0
+privacy_dp_sigma_sum = 0.0
+privacy_dp_sigma_min = None
+privacy_dp_sigma_max = None
 
 if privacy_enable and privacy_metrics:
     print("[Privacy] SNR and correlation-drop metrics enabled.")
 elif privacy_metrics:
     print("[Privacy] SNR/correlation metrics requested, but privacy_enable=False; metrics will not be computed.")
+if privacy_enable and dp_accountant:
+    print(
+        "[Privacy] Cumulative RDP accountant enabled "
+        f"(delta={privacy_delta}, sensitivity_multiplier={dp_sensitivity_multiplier})."
+    )
 client_epoch = np.ones(args.client_number,dtype=int) * client_epoch
 
 client_type_percent = [0.0, 0.0, 0.0, 0.0, 1.0]
@@ -1047,6 +1082,8 @@ class Client(object):
         global privacy_total_snr_batches, privacy_corr_drop_sum
         global privacy_corr_drop_count, privacy_client_round_snr_values
         global privacy_client_round_corr_drop_values
+        global privacy_cumulative_rdp, privacy_dp_protected_batches
+        global privacy_dp_sigma_sum, privacy_dp_sigma_min, privacy_dp_sigma_max
 
         net.train()
         self.lr , lr = new_lr, new_lr
@@ -1108,6 +1145,29 @@ class Client(object):
 
                     # The server receives the noisy (protected) activation
                     client_fx = fx_noisy.clone().detach().requires_grad_(True)
+
+                    if dp_accountant:
+                        batch_rdp = gaussian_mechanism_rdp(
+                            noise_multiplier=sigma_t,
+                            orders=privacy_rdp_orders,
+                            sensitivity_multiplier=dp_sensitivity_multiplier,
+                        )
+                        privacy_cumulative_rdp = compose_rdp(
+                            privacy_cumulative_rdp,
+                            batch_rdp,
+                        )
+                        privacy_dp_protected_batches += 1
+                        privacy_dp_sigma_sum += sigma_t
+                        privacy_dp_sigma_min = (
+                            sigma_t
+                            if privacy_dp_sigma_min is None
+                            else min(privacy_dp_sigma_min, sigma_t)
+                        )
+                        privacy_dp_sigma_max = (
+                            sigma_t
+                            if privacy_dp_sigma_max is None
+                            else max(privacy_dp_sigma_max, sigma_t)
+                        )
 
                     # Step 4: Compute and accumulate privacy metrics (§4, §5)
                     # Only compute when privacy_metrics is enabled and on the
@@ -1538,7 +1598,8 @@ for iter in range(epochs):
         # here with commit=False so it groups with the DP epsilon in one step)
         wandb.log({"Privacy/noise_multiplier": sigma_t, "epoch": iter}, commit=False)
 
-        # (ε, δ)-DP accounting via Opacus (§6)
+        # Optional Opacus per-round estimate. The formal run-level value is
+        # tracked by the built-in cumulative RDP accountant below.
         # Sampling rate q = batch_size / avg local dataset size
         q = args.batch_size / max(avg_dataset, 1)
         # Steps consumed this round: one optimizer step per batch per client epoch
@@ -1553,10 +1614,28 @@ for iter in range(epochs):
             delta=privacy_delta,
         )
         if epsilon is not None:
-            wandb.log({"Privacy/epsilon": epsilon, "epoch": iter}, commit=False)
-            print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | epsilon={epsilon:.4f} | delta={privacy_delta}")
+            wandb.log({"Privacy/Opacus_Round_Epsilon_Estimate": epsilon, "epoch": iter}, commit=False)
+            print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | Opacus round ε estimate={epsilon:.4f} | delta={privacy_delta}")
         else:
             print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | (ε,δ) accounting unavailable (install opacus)")
+
+        if dp_accountant and privacy_dp_protected_batches > 0:
+            cumulative_epsilon, best_order = get_privacy_spent_from_rdp(
+                privacy_rdp_orders,
+                privacy_cumulative_rdp,
+                privacy_delta,
+            )
+            wandb.log({
+                "Privacy/Cumulative_Epsilon": cumulative_epsilon,
+                "Privacy/Cumulative_Best_RDP_Order": best_order,
+                "Privacy/DP_Protected_Batches": privacy_dp_protected_batches,
+                "epoch": iter,
+            }, commit=False)
+            print(
+                f"[Privacy] Round {iter:3d} | cumulative ε={cumulative_epsilon:.4f} "
+                f"| δ={privacy_delta} | best α={best_order:g} | "
+                f"protected_batches={privacy_dp_protected_batches}"
+            )
      
     simulated_delay[simulated_delay==0] = np.nan  # convert zeros to nan, for when some clients not involved in the epoch
     simulated_delay_historical_df = pd.concat([simulated_delay_historical_df, pd.DataFrame(simulated_delay).T], ignore_index=True)
@@ -1656,6 +1735,41 @@ for iter in range(epochs):
     
     
 elapsed = (time.time() - start_time)/60
+
+if privacy_enable and dp_accountant:
+    if privacy_dp_protected_batches > 0:
+        final_epsilon, final_best_order = get_privacy_spent_from_rdp(
+            privacy_rdp_orders,
+            privacy_cumulative_rdp,
+            privacy_delta,
+        )
+        avg_sigma = privacy_dp_sigma_sum / privacy_dp_protected_batches
+
+        print("==========================================================")
+        print("{:^58}".format("Formal DP Accounting"))
+        print("----------------------------------------------------------")
+        print(f" Guarantee:                    (epsilon={final_epsilon:.6f}, delta={privacy_delta})")
+        print(f" Accountant:                   RDP Gaussian composition")
+        print(f" Adjacency sensitivity factor: {dp_sensitivity_multiplier:.3f}")
+        print(f" Best RDP order alpha:         {final_best_order:g}")
+        print(f" Protected batches counted:    {privacy_dp_protected_batches}")
+        print(f" Noise sigma avg/min/max:      {avg_sigma:.6f} / {privacy_dp_sigma_min:.6f} / {privacy_dp_sigma_max:.6f}")
+        print(" Scope: smashed-feature releases only")
+        print("==========================================================")
+
+        wandb.log({
+            "Privacy/Final_Epsilon": final_epsilon,
+            "Privacy/Final_Delta": privacy_delta,
+            "Privacy/Final_Best_RDP_Order": final_best_order,
+            "Privacy/Final_DP_Protected_Batches": privacy_dp_protected_batches,
+            "Privacy/Final_DP_Sensitivity_Multiplier": dp_sensitivity_multiplier,
+            "Privacy/Final_Noise_Sigma_Avg": avg_sigma,
+            "Privacy/Final_Noise_Sigma_Min": privacy_dp_sigma_min,
+            "Privacy/Final_Noise_Sigma_Max": privacy_dp_sigma_max,
+            "epoch": epochs,
+        }, commit=not privacy_metrics)
+    else:
+        print("[Privacy] Formal DP accounting unavailable: no protected batches were collected.")
 
 if privacy_enable and privacy_metrics:
     if privacy_total_snr_batches > 0 and privacy_total_noise_power > 0:
