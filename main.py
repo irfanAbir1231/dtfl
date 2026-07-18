@@ -74,6 +74,7 @@ from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic
 
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import copy
 # from multiprocessing import Process
 # import torch.multiprocessing as mp
@@ -88,7 +89,111 @@ torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
-    print(torch.cuda.get_device_name(0))    
+
+
+def get_class_names(dataset_name, num_classes):
+    """Return display labels for evaluation tables and confusion matrices."""
+    if dataset_name == "ham10000":
+        return ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+    return [str(i) for i in range(num_classes)]
+
+
+def compute_classification_metrics(y_true, y_pred, num_classes):
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for true_label, pred_label in zip(y_true, y_pred):
+        cm[int(true_label), int(pred_label)] += 1
+
+    support = cm.sum(axis=1)
+    tp = np.diag(cm).astype(np.float64)
+    predicted = cm.sum(axis=0).astype(np.float64)
+    support_float = support.astype(np.float64)
+
+    precision = np.divide(tp, predicted, out=np.zeros_like(tp), where=predicted > 0)
+    recall = np.divide(tp, support_float, out=np.zeros_like(tp), where=support_float > 0)
+    f1 = np.divide(
+        2.0 * precision * recall,
+        precision + recall,
+        out=np.zeros_like(tp),
+        where=(precision + recall) > 0,
+    )
+
+    total = cm.sum()
+    accuracy = float(tp.sum() / total) if total > 0 else 0.0
+    macro_precision = float(np.mean(precision)) if num_classes > 0 else 0.0
+    macro_recall = float(np.mean(recall)) if num_classes > 0 else 0.0
+    macro_f1 = float(np.mean(f1)) if num_classes > 0 else 0.0
+    weighted_f1 = (
+        float(np.sum(f1 * support_float) / support_float.sum())
+        if support_float.sum() > 0
+        else 0.0
+    )
+
+    return {
+        "confusion_matrix": cm,
+        "support": support,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "accuracy": accuracy,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+    }
+
+
+def save_confusion_matrix_figure(cm, class_names, round_idx, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    fig_size = max(6, min(12, len(class_names) * 1.1))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax.set(
+        xticks=np.arange(len(class_names)),
+        yticks=np.arange(len(class_names)),
+        xticklabels=class_names,
+        yticklabels=class_names,
+        ylabel="True label",
+        xlabel="Predicted label",
+        title=f"Confusion Matrix, Round {round_idx}",
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    threshold = cm.max() / 2.0 if cm.size and cm.max() > 0 else 0.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j,
+                i,
+                format(cm[i, j], "d"),
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > threshold else "black",
+                fontsize=8,
+            )
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, f"confusion_matrix_round_{round_idx:03d}.png")
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def save_classification_report_csv(metrics, class_names, round_idx, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"classification_report_round_{round_idx:03d}.csv")
+    report = pd.DataFrame(
+        {
+            "class": class_names,
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1"],
+            "support": metrics["support"],
+        }
+    )
+    report.to_csv(path, index=False)
+    return path
 
 #===================================================================
 program = "Multi-Tier Splitfed Local Loss"
@@ -918,6 +1023,8 @@ def evaluate_global_split_model(client_net, server_net, test_loader, round_idx, 
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
+    y_true = []
+    y_pred = []
 
     with torch.no_grad():
         for images, labels in test_loader:
@@ -935,14 +1042,19 @@ def evaluate_global_split_model(client_net, server_net, test_loader, round_idx, 
             batch_size = labels.size(0)
 
             total_loss += loss.item() * batch_size
-            total_correct += logits.argmax(dim=1).eq(labels).sum().item()
+            predictions = logits.argmax(dim=1)
+            total_correct += predictions.eq(labels).sum().item()
             total_samples += batch_size
+            y_true.extend(labels.detach().cpu().numpy().tolist())
+            y_pred.extend(predictions.detach().cpu().numpy().tolist())
 
     if total_samples == 0:
         raise RuntimeError("Global evaluation received an empty test loader.")
 
     loss_avg_all_user = total_loss / total_samples
     acc_avg_all_user = 100.0 * total_correct / total_samples
+    class_names = get_class_names(args.dataset, class_num)
+    metrics = compute_classification_metrics(y_true, y_pred, class_num)
 
     loss_test_collect.append(loss_avg_all_user)
     acc_test_collect.append(acc_avg_all_user)
@@ -972,15 +1084,48 @@ def evaluate_global_split_model(client_net, server_net, test_loader, round_idx, 
     print(" Test:  Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}".format(
         round_idx, acc_avg_all_user, loss_avg_all_user
     ))
+    print(" Test:  Round {:3d}, Macro F1 {:.3f} | Balanced Acc {:.3f}".format(
+        round_idx, 100.0 * metrics["macro_f1"], 100.0 * metrics["macro_recall"]
+    ))
     print("==========================================================")
+
+    results_dir = os.path.join("results", "classification")
+    cm_path = save_confusion_matrix_figure(
+        metrics["confusion_matrix"],
+        class_names,
+        round_idx,
+        results_dir,
+    )
+    report_path = save_classification_report_csv(metrics, class_names, round_idx, results_dir)
+
+    class_metric_table = wandb.Table(
+        columns=["class", "precision", "recall", "f1", "support"]
+    )
+    for idx, class_name in enumerate(class_names):
+        class_metric_table.add_data(
+            class_name,
+            float(metrics["precision"][idx]),
+            float(metrics["recall"][idx]),
+            float(metrics["f1"][idx]),
+            int(metrics["support"][idx]),
+        )
 
     wandb.log({
         "Server_Training_Accuracy": acc_avg_all_user_train,
         "Server_Test_Accuracy": acc_avg_all_user,
         "Server_Test_Loss": loss_avg_all_user,
+        "Server_Test_Macro_Precision": 100.0 * metrics["macro_precision"],
+        "Server_Test_Balanced_Accuracy": 100.0 * metrics["macro_recall"],
+        "Server_Test_Macro_F1": 100.0 * metrics["macro_f1"],
+        "Server_Test_Weighted_F1": 100.0 * metrics["weighted_f1"],
+        "Server_Test_Confusion_Matrix": wandb.Image(cm_path),
+        "Server_Test_Class_Report": class_metric_table,
         "Global_Eval_Tier": eval_tier,
         "epoch": round_idx,
     }, commit=False)
+
+    wandb.save(cm_path, policy="now")
+    wandb.save(report_path, policy="now")
 
     return loss_avg_all_user, acc_avg_all_user
 
