@@ -40,6 +40,19 @@ import logging
 
 import warnings
 
+try:
+    from sklearn.metrics import (
+        balanced_accuracy_score,
+        classification_report,
+        confusion_matrix,
+    )
+    SKLEARN_METRICS_AVAILABLE = True
+except ImportError:
+    balanced_accuracy_score = None
+    classification_report = None
+    confusion_matrix = None
+    SKLEARN_METRICS_AVAILABLE = False
+
 # Ignore all warnings
 warnings.filterwarnings("ignore")
 
@@ -51,6 +64,7 @@ from model.resnet import resnet110_SFL_local_tier_7
 
 from utils.loss import PatchShuffle
 from utils.loss import dis_corr
+from utils.loss import pairwise_distances
 from utils.fedavg import aggregated_fedavg
 from utils.privacy import (
     noise_schedule,
@@ -249,6 +263,134 @@ def build_criterion(dataset_name, train_loader, num_classes, target_device):
     class_weights = torch.tensor(class_weights, dtype=torch.float32, device=target_device)
     return nn.CrossEntropyLoss(weight=class_weights)
 
+
+def make_privacy_full_run_stats():
+    return {
+        # cumulative/pooled over the full run: one protected release == one
+        # privacy-enabled smashed-feature batch sent from client to server.
+        "protected_batches": 0,
+        "signal_power_sum": 0.0,
+        "noise_power_sum": 0.0,
+        "clean_ab_sum": 0.0,
+        "clean_aa_sum": 0.0,
+        "clean_bb_sum": 0.0,
+        "clean_pair_count": 0.0,
+        "noisy_ab_sum": 0.0,
+        "noisy_aa_sum": 0.0,
+        "noisy_bb_sum": 0.0,
+        "noisy_pair_count": 0.0,
+    }
+
+
+def dcor_component_sums(x_tensor, y_tensor):
+    """Return batch-level distance-correlation component sums for pooling."""
+    with torch.no_grad():
+        x_flat = x_tensor.detach().reshape(x_tensor.shape[0], -1)
+        y_flat = y_tensor.detach().reshape(y_tensor.shape[0], -1)
+        a = pairwise_distances(x_flat)
+        b = pairwise_distances(y_flat)
+        a_centered = a - a.mean(dim=0).unsqueeze(1) - a.mean(dim=1) + a.mean()
+        b_centered = b - b.mean(dim=0).unsqueeze(1) - b.mean(dim=1) + b.mean()
+        ab_sum = torch.sum(a_centered * b_centered).item()
+        aa_sum = torch.sum(a_centered * a_centered).item()
+        bb_sum = torch.sum(b_centered * b_centered).item()
+        pair_count = float(a.shape[1] ** 2)
+
+    return ab_sum, aa_sum, bb_sum, pair_count
+
+
+def pooled_dcor_from_components(ab_sum, aa_sum, bb_sum, pair_count):
+    """Compute one pooled dCor value from cumulative release components."""
+    if pair_count <= 0 or aa_sum <= 0 or bb_sum <= 0:
+        return None
+
+    dcov2 = max(ab_sum / pair_count, 0.0)
+    dvar_x2 = max(aa_sum / pair_count, 0.0)
+    dvar_y2 = max(bb_sum / pair_count, 0.0)
+    if dvar_x2 <= 0 or dvar_y2 <= 0:
+        return None
+
+    return math.sqrt(dcov2) / math.sqrt(math.sqrt(dvar_x2) * math.sqrt(dvar_y2))
+
+
+def update_privacy_full_run_stats(images, fx_clipped, fx_noisy):
+    """Accumulate cumulative/pooled privacy diagnostics for the final block."""
+    global privacy_full_run_stats, privacy_round_protected_batches
+
+    with torch.no_grad():
+        signal_power = fx_clipped.detach().pow(2).sum().item()
+        noise_power = (fx_noisy.detach() - fx_clipped.detach()).pow(2).sum().item()
+
+    clean_ab, clean_aa, clean_bb, clean_pairs = dcor_component_sums(images, fx_clipped)
+    noisy_ab, noisy_aa, noisy_bb, noisy_pairs = dcor_component_sums(images, fx_noisy)
+
+    privacy_full_run_stats["protected_batches"] += 1
+    privacy_full_run_stats["signal_power_sum"] += signal_power
+    privacy_full_run_stats["noise_power_sum"] += noise_power
+    privacy_full_run_stats["clean_ab_sum"] += clean_ab
+    privacy_full_run_stats["clean_aa_sum"] += clean_aa
+    privacy_full_run_stats["clean_bb_sum"] += clean_bb
+    privacy_full_run_stats["clean_pair_count"] += clean_pairs
+    privacy_full_run_stats["noisy_ab_sum"] += noisy_ab
+    privacy_full_run_stats["noisy_aa_sum"] += noisy_aa
+    privacy_full_run_stats["noisy_bb_sum"] += noisy_bb
+    privacy_full_run_stats["noisy_pair_count"] += noisy_pairs
+    privacy_round_protected_batches += 1
+
+
+def get_cumulative_dp_epsilon(rdp_events, delta):
+    """Compose all protected releases with RDP, allowing sigma to vary by round."""
+    if not rdp_events:
+        return None
+
+    try:
+        from opacus.privacy_analysis import compute_rdp, get_privacy_spent  # noqa: PLC0415
+
+        orders = list(range(2, 64)) + [128, 256]
+        total_rdp = np.zeros(len(orders), dtype=np.float64)
+        for sample_rate, noise_multiplier, num_steps in rdp_events:
+            if sample_rate <= 0 or noise_multiplier <= 0 or num_steps <= 0:
+                continue
+            total_rdp += np.asarray(
+                compute_rdp(
+                    q=sample_rate,
+                    noise_multiplier=noise_multiplier,
+                    steps=int(num_steps),
+                    orders=orders,
+                ),
+                dtype=np.float64,
+            )
+        if not np.any(total_rdp):
+            return None
+        epsilon, _ = get_privacy_spent(orders=orders, rdp=total_rdp, delta=delta)
+        return float(epsilon)
+    except ImportError:
+        logging.info(
+            "opacus is not installed; final cumulative (epsilon, delta)-DP accounting is disabled."
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Final cumulative DP accounting failed: %s", exc)
+        return None
+
+
+def format_final_value(value, precision=6):
+    if value is None:
+        return "N/A"
+    if isinstance(value, (int, np.integer)):
+        return f"{int(value)}"
+    if isinstance(value, (float, np.floating)):
+        if math.isinf(float(value)):
+            return "inf"
+        if math.isnan(float(value)):
+            return "nan"
+        return f"{float(value):.{precision}f}"
+    return str(value)
+
+
+def print_final_kv(label, value, precision=6):
+    print(" {:<56}: {}".format(label, format_final_value(value, precision)))
+
 DYNAMIC_LR_THRESHOLD = 0.0001
 DEFAULT_FRAC = 1.0        # participation of clients
 
@@ -328,6 +470,11 @@ privacy_metrics      = args.privacy_metrics          # enable metric computation
 privacy_log_interval = args.privacy_log_interval     # log every N rounds
 # sigma_t is updated at the start of each round in the main loop
 sigma_t = noise_sigma0  # initialise to sigma_0
+
+# Final Table 2 state: cumulative/pooled over all protected releases in the run.
+privacy_full_run_stats = make_privacy_full_run_stats()
+privacy_rdp_events = []  # entries are (sample_rate q, sigma_t, protected_batches_this_round)
+privacy_round_protected_batches = 0
 
 if privacy_enable and privacy_metrics:
     print("[Privacy] SNR and correlation-drop metrics enabled.")
@@ -925,6 +1072,315 @@ def evaluate_global_split_model(client_net, server_net, test_loader, round_idx, 
     return loss_avg_all_user, acc_avg_all_user
 
 
+def collect_final_model_predictions(client_net, server_net, test_loader):
+    """Final-model-only inference pass over the full held-out test set."""
+    client_eval = copy.deepcopy(client_net).to(device)
+    server_eval = copy.deepcopy(server_net).to(device)
+    client_eval.eval()
+    server_eval.eval()
+
+    y_true = []
+    y_pred = []
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device).long()
+
+            client_output = client_eval(images)
+            if isinstance(client_output, tuple):
+                _, fx = client_output
+            else:
+                fx = client_output
+
+            logits = server_eval(fx.to(device))
+            y_true.extend(labels.detach().cpu().numpy().astype(int).tolist())
+            y_pred.extend(logits.argmax(dim=1).detach().cpu().numpy().astype(int).tolist())
+
+    if not y_true:
+        raise RuntimeError("Final class-wise evaluation received an empty test loader.")
+
+    return np.asarray(y_true, dtype=np.int64), np.asarray(y_pred, dtype=np.int64)
+
+
+def fallback_classification_report(y_true, y_pred, labels, target_names):
+    """Small sklearn-compatible fallback used only when sklearn is unavailable."""
+    matrix = np.zeros((len(labels), len(labels)), dtype=np.int64)
+    label_to_index = {label: i for i, label in enumerate(labels)}
+    for actual, predicted in zip(y_true, y_pred):
+        if actual in label_to_index and predicted in label_to_index:
+            matrix[label_to_index[actual], label_to_index[predicted]] += 1
+
+    report = {}
+    f1_values = []
+    recall_values = []
+    weighted_f1_sum = 0.0
+    total_support = int(matrix.sum())
+
+    for i, class_name in enumerate(target_names):
+        tp = float(matrix[i, i])
+        fp = float(matrix[:, i].sum() - matrix[i, i])
+        fn = float(matrix[i, :].sum() - matrix[i, i])
+        support = int(matrix[i, :].sum())
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / support if support > 0 else 0.0
+        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+        report[class_name] = {
+            "precision": precision,
+            "recall": recall,
+            "f1-score": f1,
+            "support": support,
+        }
+        f1_values.append(f1)
+        recall_values.append(recall)
+        weighted_f1_sum += f1 * support
+
+    report["macro avg"] = {
+        "precision": float(np.mean([report[name]["precision"] for name in target_names])),
+        "recall": float(np.mean(recall_values)),
+        "f1-score": float(np.mean(f1_values)),
+        "support": total_support,
+    }
+    report["weighted avg"] = {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1-score": weighted_f1_sum / total_support if total_support > 0 else 0.0,
+        "support": total_support,
+    }
+
+    return report, matrix, float(np.mean(recall_values))
+
+
+def compute_final_classwise_metrics(client_net, server_net, test_loader):
+    """Table 4 state: final-model-only metrics from one held-out test pass."""
+    if args.dataset == "ham10000" and class_num == 7:
+        class_labels = list(range(7))
+        class_names = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+    else:
+        class_labels = list(range(class_num))
+        class_names = [str(i) for i in class_labels]
+
+    y_true, y_pred = collect_final_model_predictions(client_net, server_net, test_loader)
+
+    if SKLEARN_METRICS_AVAILABLE:
+        report = classification_report(
+            y_true,
+            y_pred,
+            labels=class_labels,
+            target_names=class_names,
+            output_dict=True,
+            zero_division=0,
+        )
+        conf_matrix = confusion_matrix(y_true, y_pred, labels=class_labels)
+        bal_acc = balanced_accuracy_score(y_true, y_pred)
+    else:
+        report, conf_matrix, bal_acc = fallback_classification_report(
+            y_true,
+            y_pred,
+            class_labels,
+            class_names,
+        )
+
+    return {
+        "class_labels": class_labels,
+        "class_names": class_names,
+        "report": report,
+        "macro_f1": float(report["macro avg"]["f1-score"]),
+        "balanced_accuracy": float(bal_acc),
+        "weighted_f1": float(report["weighted avg"]["f1-score"]),
+        "confusion_matrix": np.asarray(conf_matrix, dtype=np.int64),
+        "test_samples": int(len(y_true)),
+    }
+
+
+def build_final_privacy_summary():
+    """Table 2 state: cumulative/pooled over every protected release."""
+    protected_batches = int(privacy_full_run_stats["protected_batches"])
+    signal_power_sum = privacy_full_run_stats["signal_power_sum"]
+    noise_power_sum = privacy_full_run_stats["noise_power_sum"]
+
+    if protected_batches > 0 and noise_power_sum > 0:
+        overall_snr = signal_power_sum / noise_power_sum
+    elif protected_batches > 0 and noise_power_sum == 0:
+        overall_snr = float("inf")
+    else:
+        overall_snr = None
+
+    if overall_snr is None:
+        overall_snr_db = None
+    elif math.isinf(overall_snr):
+        overall_snr_db = float("inf")
+    elif overall_snr > 0:
+        overall_snr_db = 10.0 * math.log10(overall_snr)
+    else:
+        overall_snr_db = None
+
+    clean_dcor = pooled_dcor_from_components(
+        privacy_full_run_stats["clean_ab_sum"],
+        privacy_full_run_stats["clean_aa_sum"],
+        privacy_full_run_stats["clean_bb_sum"],
+        privacy_full_run_stats["clean_pair_count"],
+    )
+    noisy_dcor = pooled_dcor_from_components(
+        privacy_full_run_stats["noisy_ab_sum"],
+        privacy_full_run_stats["noisy_aa_sum"],
+        privacy_full_run_stats["noisy_bb_sum"],
+        privacy_full_run_stats["noisy_pair_count"],
+    )
+
+    if clean_dcor is not None and abs(clean_dcor) > 1e-8 and noisy_dcor is not None:
+        overall_corr_drop_pct = 100.0 * (clean_dcor - noisy_dcor) / abs(clean_dcor)
+    else:
+        overall_corr_drop_pct = None
+
+    final_epsilon = get_cumulative_dp_epsilon(privacy_rdp_events, privacy_delta)
+
+    return {
+        "overall_snr": overall_snr,
+        "overall_snr_db": overall_snr_db,
+        "clean_dcor": clean_dcor,
+        "noisy_dcor": noisy_dcor,
+        "overall_corr_drop_pct": overall_corr_drop_pct,
+        "final_epsilon": final_epsilon,
+        "delta": privacy_delta,
+        "protected_batches": protected_batches,
+    }
+
+
+def print_and_log_final_tables(rounds_completed, active_clients_per_round, round_time_seconds):
+    """Print once after training: Tables 2/3/4 and W&B final metrics."""
+    table2 = build_final_privacy_summary()
+    avg_active_clients = (
+        float(np.mean(active_clients_per_round)) if active_clients_per_round else 0.0
+    )
+    avg_round_time = (
+        float(np.mean(round_time_seconds)) if round_time_seconds else 0.0
+    )
+    total_model_mb = model_parameter_data_size / 1024 ** 2
+    total_smashed_mb = intermediate_data_size / 1024 ** 2
+
+    final_eval_tier = num_tiers
+    table4 = compute_final_classwise_metrics(
+        net_glob_client_tier[final_eval_tier],
+        net_glob_server_tier[final_eval_tier],
+        test_data_global,
+    )
+
+    print("==========================================================")
+    print("{:^58}".format("TABLE 2 — PRIVACY DIAGNOSTICS (final, pooled over entire run)"))
+    print("----------------------------------------------------------")
+    print_final_kv("Total protected batches counted", table2["protected_batches"], 0)
+    print_final_kv("Total rounds completed", f"{rounds_completed}/{epochs}")
+    print_final_kv("Overall SNR (unitless)", table2["overall_snr"])
+    print_final_kv("Overall SNR (dB)", table2["overall_snr_db"])
+    print_final_kv("Overall correlation drop (%)", table2["overall_corr_drop_pct"])
+    print_final_kv("Final epsilon", table2["final_epsilon"])
+    print_final_kv("delta", table2["delta"])
+    print("==========================================================")
+
+    print("==========================================================")
+    print("{:^58}".format("TABLE 3 — RESOURCE & COMMUNICATION (final, cumulative over entire run)"))
+    print("----------------------------------------------------------")
+    print_final_kv("Total model-parameter data transferred (MB)", total_model_mb)
+    print_final_kv("Total smashed-feature data transferred (MB)", total_smashed_mb)
+    print_final_kv("Average active clients per round", avg_active_clients)
+    print_final_kv("Average round time (seconds)", avg_round_time)
+    print_final_kv("Total rounds completed", f"{rounds_completed}/{epochs}")
+    print("==========================================================")
+
+    print("==========================================================")
+    print("{:^58}".format("TABLE 4 — CLASS-WISE TEST PERFORMANCE (final model only)"))
+    print("----------------------------------------------------------")
+    print_final_kv("Final evaluation tier", final_eval_tier, 0)
+    print_final_kv("Held-out test samples", table4["test_samples"], 0)
+    for class_name in table4["class_names"]:
+        class_metrics = table4["report"][class_name]
+        print(
+            " {:<8} precision: {:>9} | recall: {:>9} | F1: {:>9} | support: {:>6}".format(
+                class_name,
+                format_final_value(class_metrics["precision"]),
+                format_final_value(class_metrics["recall"]),
+                format_final_value(class_metrics["f1-score"]),
+                format_final_value(int(class_metrics["support"]), 0),
+            )
+        )
+    print("----------------------------------------------------------")
+    print_final_kv("Macro-F1", table4["macro_f1"])
+    print_final_kv("Balanced accuracy", table4["balanced_accuracy"])
+    print_final_kv("Weighted-F1", table4["weighted_f1"])
+    print(" Confusion matrix (rows=true, cols=pred):")
+    print(" {:>8} {}".format("", " ".join(f"{name:>6}" for name in table4["class_names"])))
+    for class_name, row in zip(table4["class_names"], table4["confusion_matrix"]):
+        print(" {:>8} {}".format(class_name, " ".join(f"{int(value):6d}" for value in row)))
+    print("==========================================================")
+
+    wandb_metrics = {
+        "Final/Table2_Total_Protected_Batches": table2["protected_batches"],
+        "Final/Table2_Rounds_Completed": rounds_completed,
+        "Final/Table2_Target_Rounds": epochs,
+        "Final/Table2_Overall_SNR": table2["overall_snr"],
+        "Final/Table2_Overall_SNR_dB": table2["overall_snr_db"],
+        "Final/Table2_Pooled_dCor_x_f_clip": table2["clean_dcor"],
+        "Final/Table2_Pooled_dCor_x_f_noisy": table2["noisy_dcor"],
+        "Final/Table2_Overall_Correlation_Drop_Percent": table2["overall_corr_drop_pct"],
+        "Final/Table2_Epsilon": table2["final_epsilon"],
+        "Final/Table2_Delta": table2["delta"],
+        "Final/Table3_Total_Model_Parameter_Data_MB": total_model_mb,
+        "Final/Table3_Total_Smashed_Feature_Data_MB": total_smashed_mb,
+        "Final/Table3_Average_Active_Clients_Per_Round": avg_active_clients,
+        "Final/Table3_Average_Round_Time_Seconds": avg_round_time,
+        "Final/Table4_Macro_F1": table4["macro_f1"],
+        "Final/Table4_Balanced_Accuracy": table4["balanced_accuracy"],
+        "Final/Table4_Weighted_F1": table4["weighted_f1"],
+        "Final/Table4_Test_Samples": table4["test_samples"],
+        "epoch": rounds_completed,
+    }
+
+    for class_name in table4["class_names"]:
+        class_metrics = table4["report"][class_name]
+        wandb_metrics[f"Final/Table4/{class_name}_Precision"] = class_metrics["precision"]
+        wandb_metrics[f"Final/Table4/{class_name}_Recall"] = class_metrics["recall"]
+        wandb_metrics[f"Final/Table4/{class_name}_F1"] = class_metrics["f1-score"]
+        wandb_metrics[f"Final/Table4/{class_name}_Support"] = class_metrics["support"]
+
+    wandb_metrics = {
+        key: (float("nan") if value is None else value)
+        for key, value in wandb_metrics.items()
+    }
+
+    classwise_table = wandb.Table(
+        columns=["class", "precision", "recall", "f1", "support"],
+        data=[
+            [
+                class_name,
+                table4["report"][class_name]["precision"],
+                table4["report"][class_name]["recall"],
+                table4["report"][class_name]["f1-score"],
+                int(table4["report"][class_name]["support"]),
+            ]
+            for class_name in table4["class_names"]
+        ],
+    )
+    confusion_table = wandb.Table(
+        columns=["true_class"] + table4["class_names"],
+        data=[
+            [class_name] + [int(value) for value in row]
+            for class_name, row in zip(table4["class_names"], table4["confusion_matrix"])
+        ],
+    )
+
+    wandb.log(wandb_metrics, commit=False)
+    wandb.log(
+        {
+            "Final/Table4_Classwise_Report": classwise_table,
+            "Final/Table4_Confusion_Matrix": confusion_table,
+            "epoch": rounds_completed,
+        },
+        commit=True,
+    )
+
+
 #==============================================================================================================
 #                                       Clients-side Program
 #==============================================================================================================
@@ -943,6 +1399,8 @@ class Client(object):
         
 
     def train(self, net, round_idx):
+        global privacy_round_protected_batches
+
         net.train()
         self.lr , lr = new_lr, new_lr
 
@@ -1003,6 +1461,11 @@ class Client(object):
 
                     # The server receives the noisy (protected) activation
                     client_fx = fx_noisy.clone().detach().requires_grad_(True)
+
+                    # Final Table 2 cumulative/pooled full-run state. This
+                    # intentionally runs for every protected release, not only
+                    # on privacy_log_interval rounds.
+                    update_privacy_full_run_stats(images, fx_clipped, fx_noisy)
 
                     # Step 4: Compute and accumulate privacy metrics (§4, §5)
                     # Only compute when privacy_metrics is enabled and on the
@@ -1254,8 +1717,16 @@ computation_time_clients = {}
 for k in range(num_users):
     computation_time_clients[k] = []
 
+# Final Table 3 state: per-round means and cumulative communication totals.
+active_clients_per_round_final = []
+round_time_seconds_final = []
+rounds_completed_final = 0
+
 # Main loop over rounds
 for iter in range(epochs):
+    round_wall_start = time.time()
+    privacy_round_protected_batches = 0
+
     # -------------------------------------------------------------------
     # Privacy: adaptive noise schedule  (privacy-implementation-plan.md §2)
     # Compute sigma_t for this round: sigma_t = max(sigma_min, sigma0 * decay^t)
@@ -1265,7 +1736,10 @@ for iter in range(epochs):
     sigma_t = noise_schedule(iter, noise_sigma0, noise_sigma_min, noise_decay)  # noqa: F811
     if privacy_enable:
         wandb.log({"Privacy/sigma_t": sigma_t, "epoch": iter}, commit=False)
-    if iter == int(50): # here we can change how the enviroement randomly change 
+    if iter == int(50): # here we can change how the enviroement randomly change
+        active_clients_per_round_final.append(0)
+        round_time_seconds_final.append(time.time() - round_wall_start)
+        rounds_completed_final += 1
         continue
         delay_coefficient[0] = delay_coefficient_list[2]
         net_speed[0] = net_speed_list[2]
@@ -1341,6 +1815,9 @@ for iter in range(epochs):
     if m == 0:
         print(f"Round {iter}: all sampled clients dropped out — skipping round.")
         wandb.log({"Active_Clients": 0, "epoch": iter}, commit=True)
+        active_clients_per_round_final.append(0)
+        round_time_seconds_final.append(time.time() - round_wall_start)
+        rounds_completed_final += 1
         continue
 
     wandb.log({"Active_Clients": m, "epoch": iter}, commit=False)
@@ -1404,7 +1881,11 @@ for iter in range(epochs):
             }, commit=False)
 
         wandb.log({"Client{}_Total_Delay".format(idx): simulated_delay[idx], "epoch": iter}, commit=False)
-        
+
+    if privacy_enable and privacy_round_protected_batches > 0:
+        cumulative_q = min(args.batch_size / max(avg_dataset, 1), 1.0)
+        privacy_rdp_events.append((cumulative_q, sigma_t, privacy_round_protected_batches))
+
     server_wait_first_to_last_client = (max(simulated_delay * client_epoch) - min(simulated_delay * client_epoch))
     training_time = (max(simulated_delay))
     total_training_time += training_time
@@ -1527,13 +2008,23 @@ for iter in range(epochs):
 
     wandb.log({"Model_Parameter_Data_Transmission(MB) ": model_parameter_data_size/1024**2, "epoch": iter}, commit=False)
     wandb.log({"Intermediate_Data_Transmission(MB) ": intermediate_data_size/1024**2, "epoch": iter}, commit=True)
-    
-    
-elapsed = (time.time() - start_time)/60
-    
-#===================================================================================     
 
-print("Training and Evaluation completed!")    
+    active_clients_per_round_final.append(m)
+    round_time_seconds_final.append(time.time() - round_wall_start)
+    rounds_completed_final += 1
+
+
+elapsed = (time.time() - start_time)/60
+
+print_and_log_final_tables(
+    rounds_completed_final,
+    active_clients_per_round_final,
+    round_time_seconds_final,
+)
+
+#===================================================================================
+
+print("Training and Evaluation completed!")
     
 
 #=============================================================================
