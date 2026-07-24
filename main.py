@@ -66,6 +66,10 @@ from utils.loss import PatchShuffle
 from utils.loss import dis_corr
 from utils.loss import pairwise_distances
 from utils.fedavg import aggregated_fedavg
+from utils.federated_aggregators import (
+    SUPPORTED_ALGORITHMS,
+    create_server_aggregator,
+)
 from utils.privacy import (
     noise_schedule,
     clip_features,
@@ -148,6 +152,51 @@ def add_args(parser):
     parser.add_argument('--rounds', default=250, type=int)
     parser.add_argument('--whether_local_loss', default=True, type=bool)
     parser.add_argument('--tier', default=5, type=int)
+    parser.add_argument(
+        '--algorithm',
+        type=str.lower,
+        choices=SUPPORTED_ALGORITHMS,
+        default='fedavg',
+        help=(
+            'Federated server aggregation algorithm. '
+            'Choose from: fedavg, fedavgm, fedyogi, fedadagrad '
+            '(default: fedavg).'
+        ),
+    )
+    parser.add_argument(
+        '--server_lr',
+        type=float,
+        default=None,
+        help=(
+            'Server aggregation learning rate. Algorithm defaults are used '
+            'when omitted: 1.0 for FedAvgM, 0.01 for FedYogi, and 0.1 for '
+            'FedAdagrad.'
+        ),
+    )
+    parser.add_argument(
+        '--server_momentum',
+        type=float,
+        default=0.9,
+        help='FedAvgM server momentum (default: 0.9).',
+    )
+    parser.add_argument(
+        '--server_beta1',
+        type=float,
+        default=0.9,
+        help='FedYogi first-moment coefficient (default: 0.9).',
+    )
+    parser.add_argument(
+        '--server_beta2',
+        type=float,
+        default=0.99,
+        help='FedYogi second-moment coefficient (default: 0.99).',
+    )
+    parser.add_argument(
+        '--server_tau',
+        type=float,
+        default=1e-3,
+        help='FedYogi/FedAdagrad numerical stability term (default: 1e-3).',
+    )
         
     
     # Decorrelation / obfuscation arguments (pre-existing)
@@ -452,6 +501,15 @@ NUM_CPUs = os.cpu_count()
 
 parser = argparse.ArgumentParser()
 args = add_args(parser)
+server_aggregator = create_server_aggregator(
+    args.algorithm,
+    server_lr=args.server_lr,
+    server_momentum=args.server_momentum,
+    server_beta1=args.server_beta1,
+    server_beta2=args.server_beta2,
+    server_tau=args.server_tau,
+)
+print(f"Federated aggregation: {server_aggregator}")
 args.dataset = normalize_dataset_name(args.dataset)
 if args.dataset == "ham10000":
     args.data_dir, detected_client_number = discover_ham10000_client_count(args.data_dir)
@@ -2114,13 +2172,21 @@ for iter in range(epochs):
     
     
             
-    w_glob = aggregated_fedavg(w_locals_tier, w_locals_client, num_tiers, num_users, whether_local_loss, client_sample, idxs_users) # w_locals_tier is for server-side
+    w_fedavg = aggregated_fedavg(
+        w_locals_tier,
+        w_locals_client,
+        num_tiers,
+        num_users,
+        whether_local_loss,
+        client_sample,
+        idxs_users,
+    )
+    w_glob = server_aggregator.aggregate(w_glob, w_fedavg)
 
     # TITAN Step 5 — server-side EMA of the aggregated global weights.
-    # When --use_titan_ema is set, w_glob is replaced with the smoothed EMA
-    # state. The raw average is still computed (above) so FedAvg semantics
-    # are preserved on every call; the EMA only changes what gets *broadcast*
-    # and *evaluated*. Falls through unchanged when EMA is disabled.
+    # When --use_titan_ema is set, the selected aggregator's global update is
+    # replaced with the smoothed EMA state before broadcast and evaluation.
+    # Falls through unchanged when EMA is disabled.
     if titan_server_ema is not None:
         w_glob = titan_server_ema.update(w_glob)
 
