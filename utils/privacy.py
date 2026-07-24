@@ -224,8 +224,8 @@ def get_dp_epsilon(
 
     try:
         # Opacus ≥ 1.0 exposes privacy analysis in opacus.privacy_analysis
-        from opacus.privacy_analysis import compute_rdp, get_privacy_spent  # noqa: PLC0415
-
+        from opacus.accountants.analysis.rdp import compute_rdp, get_privacy_spent  # noqa: PLC0415
+    
         # Orders for Rényi DP
         orders = list(range(2, 64)) + [128, 256]
         rdp = compute_rdp(
