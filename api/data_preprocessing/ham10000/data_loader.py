@@ -36,20 +36,33 @@ def _discover_client_csvs(dataset_dir):
     return client_csvs
 
 
-def _data_transforms_ham10000():
-    train_transform = transforms.Compose([
-        transforms.Resize((HAM10000_IMAGE_SIZE, HAM10000_IMAGE_SIZE)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+def _data_transforms_ham10000(strong_aug: bool = False):
+    """Build train + test transforms.
 
-    test_transform = transforms.Compose([
-        transforms.Resize((HAM10000_IMAGE_SIZE, HAM10000_IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+    Args:
+        strong_aug: When True, replace the baseline train transform with the
+                    TITAN Step-4 strong-augment pipeline (RandAugment +
+                    RandomErasing) from utils.augmentation. Test transform
+                    is always the deterministic baseline.
+    """
+    if strong_aug:
+        from utils.augmentation import build_titan_train_transform, build_titan_eval_transform
+        train_transform = build_titan_train_transform(HAM10000_IMAGE_SIZE, strong=True)
+        test_transform = build_titan_eval_transform(HAM10000_IMAGE_SIZE)
+    else:
+        train_transform = transforms.Compose([
+            transforms.Resize((HAM10000_IMAGE_SIZE, HAM10000_IMAGE_SIZE)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+
+        test_transform = transforms.Compose([
+            transforms.Resize((HAM10000_IMAGE_SIZE, HAM10000_IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
 
     return train_transform, test_transform
 
@@ -97,9 +110,9 @@ def _read_metadata(csv_path):
     return dataframe
 
 
-def get_dataloader_ham10000(data_dir, train_bs, test_bs, csv_path_train, csv_path_test):
+def get_dataloader_ham10000(data_dir, train_bs, test_bs, csv_path_train, csv_path_test, strong_aug: bool = False):
     dataset_root, _ = _resolve_dataset_root(data_dir)
-    train_transform, test_transform = _data_transforms_ham10000()
+    train_transform, test_transform = _data_transforms_ham10000(strong_aug=strong_aug)
 
     train_df = _read_metadata(csv_path_train)
     test_df = _read_metadata(csv_path_test)
@@ -113,7 +126,7 @@ def get_dataloader_ham10000(data_dir, train_bs, test_bs, csv_path_train, csv_pat
     return train_dl, test_dl
 
 
-def load_partition_data_ham10000(dataset, data_dir, partition_method, partition_alpha, client_number, batch_size):
+def load_partition_data_ham10000(dataset, data_dir, partition_method, partition_alpha, client_number, batch_size, strong_aug: bool = False):
     del dataset, partition_method, partition_alpha
 
     dataset_root, dataset_dir = _resolve_dataset_root(data_dir)
@@ -147,6 +160,7 @@ def load_partition_data_ham10000(dataset, data_dir, partition_method, partition_
         batch_size,
         global_train_csv,
         global_test_csv,
+        strong_aug=strong_aug,
     )
     logging.info("train_dl_global number = %s", len(train_data_global))
     logging.info("test_dl_global number = %s", len(test_data_global))
@@ -168,6 +182,7 @@ def load_partition_data_ham10000(dataset, data_dir, partition_method, partition_
             batch_size,
             client_csv,
             global_test_csv,
+            strong_aug=strong_aug,
         )
         logging.info(
             "client_idx = %d, batch_num_train_local = %d, batch_num_test_local = %d",
