@@ -42,6 +42,69 @@ class FederatedAggregatorTests(unittest.TestCase):
         self.assertTrue(torch.allclose(first["weight"], torch.tensor([1.0])))
         self.assertTrue(torch.allclose(second["weight"], torch.tensor([2.9])))
 
+    def test_stateful_aggregators_directly_average_batch_norm_buffers(self):
+        aggregators = (
+            FedAvgMAggregator(server_lr=1.0, momentum=0.9),
+            FedYogiAggregator(
+                server_lr=0.01,
+                beta1=0.9,
+                beta2=0.99,
+                tau=1e-3,
+            ),
+            FedAdagradAggregator(server_lr=0.1, tau=1e-3),
+        )
+        initial = {
+            "layer.bn.running_mean": torch.tensor([0.0]),
+            "layer.bn.running_var": torch.tensor([1.0]),
+            "layer.bn.num_batches_tracked": torch.tensor(
+                0,
+                dtype=torch.long,
+            ),
+        }
+        first_average = {
+            "layer.bn.running_mean": torch.tensor([1.0]),
+            "layer.bn.running_var": torch.tensor([2.0]),
+            "layer.bn.num_batches_tracked": torch.tensor(
+                3,
+                dtype=torch.long,
+            ),
+        }
+        second_average = {
+            "layer.bn.running_mean": torch.tensor([3.0]),
+            "layer.bn.running_var": torch.tensor([4.0]),
+            "layer.bn.num_batches_tracked": torch.tensor(
+                8,
+                dtype=torch.long,
+            ),
+        }
+
+        for aggregator in aggregators:
+            with self.subTest(algorithm=aggregator.name):
+                first = aggregator.aggregate(initial, first_average)
+                second = aggregator.aggregate(first, second_average)
+
+                for key, expected in second_average.items():
+                    self.assertTrue(torch.equal(second[key], expected))
+
+    def test_batch_norm_trainable_parameters_still_use_fedavgm(self):
+        aggregator = FedAvgMAggregator(server_lr=1.0, momentum=0.9)
+
+        first = aggregator.aggregate(
+            {"layer.bn.weight": torch.tensor([0.0])},
+            {"layer.bn.weight": torch.tensor([1.0])},
+        )
+        second = aggregator.aggregate(
+            first,
+            {"layer.bn.weight": torch.tensor([2.0])},
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                second["layer.bn.weight"],
+                torch.tensor([2.9]),
+            )
+        )
+
     def test_fedadagrad_accumulates_squared_updates(self):
         aggregator = FedAdagradAggregator(server_lr=0.1, tau=1e-6)
 

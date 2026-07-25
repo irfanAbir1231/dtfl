@@ -28,6 +28,14 @@ _DEFAULT_SERVER_LR = {
 
 StateDict = Mapping[str, torch.Tensor]
 
+# BatchNorm running statistics are buffers, not gradient-trained parameters.
+# Stateful server optimizers must not build momentum/adaptive state for them.
+_BATCH_NORM_BUFFER_SUFFIXES = (
+    "running_mean",
+    "running_var",
+    "num_batches_tracked",
+)
+
 
 def _validate_positive(name: str, value: float) -> None:
     if value <= 0.0:
@@ -37,6 +45,10 @@ def _validate_positive(name: str, value: float) -> None:
 def _validate_unit_interval(name: str, value: float) -> None:
     if not 0.0 <= value < 1.0:
         raise ValueError(f"{name} must be in [0, 1), got {value}.")
+
+
+def _is_batch_norm_buffer(key: str) -> bool:
+    return key.endswith(_BATCH_NORM_BUFFER_SUFFIXES)
 
 
 class ServerAggregator(ABC):
@@ -118,7 +130,16 @@ class _StatefulServerAggregator(ServerAggregator):
                     continue
 
                 current = current_state[key]
-                if not torch.is_floating_point(current):
+                if (
+                    _is_batch_norm_buffer(key)
+                    or not torch.is_floating_point(current)
+                ):
+                    if current.shape != averaged.shape:
+                        raise ValueError(
+                            f"Cannot aggregate parameter '{key}': current "
+                            f"shape {tuple(current.shape)} does not match "
+                            f"averaged shape {tuple(averaged.shape)}."
+                        )
                     result[key] = averaged.to(
                         device=current.device,
                         dtype=current.dtype,
