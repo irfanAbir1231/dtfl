@@ -394,7 +394,10 @@ def get_cumulative_dp_epsilon(rdp_events, delta):
         return None
 
     try:
-        from opacus.privacy_analysis import compute_rdp, get_privacy_spent  # noqa: PLC0415
+        from opacus.accountants.analysis.rdp import (  # noqa: PLC0415
+            compute_rdp,
+            get_privacy_spent,
+        )
 
         orders = list(range(2, 64)) + [128, 256]
         total_rdp = np.zeros(len(orders), dtype=np.float64)
