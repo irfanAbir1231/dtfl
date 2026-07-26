@@ -194,7 +194,7 @@ def get_dp_epsilon(
 ) -> Optional[float]:
     """Compute the privacy budget ε for the given accounting parameters.
 
-    Uses ``opacus.privacy_analysis`` if the library is installed.
+    Uses Opacus' RDP accounting analysis API if the library is installed.
     Returns ``None`` gracefully when opacus is not available, so the rest of
     training is completely unaffected.
 
@@ -223,7 +223,7 @@ def get_dp_epsilon(
         return None
 
     try:
-        # Opacus ≥ 1.0 exposes privacy analysis in opacus.privacy_analysis
+        # Opacus ≥ 1.0 exposes RDP analysis through the accountants package.
         from opacus.accountants.analysis.rdp import compute_rdp, get_privacy_spent  # noqa: PLC0415
     
         # Orders for Rényi DP
