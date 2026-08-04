@@ -14,8 +14,20 @@ sh download_dataset.sh
 "
 
 ## Usage
-To train the model, run the following command:
 
-'''
+HAM10000 is the default dataset:
+
+```bash
 python3 main.py
-'''
+```
+
+To train with CIFAR-10 instead, use either the standard option or the spelling
+used by older commands:
+
+```bash
+python3 main.py --dataset cifar10
+python3 main.py --datatset cifer
+```
+
+The CIFAR-10 loader downloads the dataset into `./data` automatically when it
+is not already present.

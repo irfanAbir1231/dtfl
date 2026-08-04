@@ -131,8 +131,19 @@ def add_args(parser):
     
     
     # Data loading and preprocessing related arguments
-    parser.add_argument('--dataset', type=str, default='ham10000', metavar='N',
-                        help='dataset used for training: ham10000, flower, cifar10, cifar100, cinic10')
+    parser.add_argument(
+        '--dataset',
+        '--datatset',
+        dest='dataset',
+        type=str,
+        default='ham10000',
+        metavar='NAME',
+        help=(
+            'dataset used for training (default: ham10000). '
+            'Use cifar10, cifar, or cifer for CIFAR-10. '
+            '--datatset is supported as a backwards-compatible spelling.'
+        ),
+    )
     parser.add_argument('--data_dir', type=str, default='./data', help='data directory')
     parser.add_argument('--partition_method', type=str, default='hetero', metavar='N',
                         help='how to partition the dataset on local workers')
@@ -268,12 +279,15 @@ def add_args(parser):
 
 
 HAM10000_ALIASES = {"ham10000", "flower", "flower_framework"}
+CIFAR10_ALIASES = {"cifar10", "cifar", "cifer", "cifer10", "cifar_10", "cifar-10"}
 
 
 def normalize_dataset_name(dataset_name):
-    dataset_key = dataset_name.lower().replace(" ", "_")
+    dataset_key = dataset_name.strip().lower().replace(" ", "_")
     if dataset_key in HAM10000_ALIASES:
         return "ham10000"
+    if dataset_key in CIFAR10_ALIASES:
+        return "cifar10"
     return dataset_key
 
 
