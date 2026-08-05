@@ -15,6 +15,12 @@ sh download_dataset.sh
 
 ## Usage
 
+Install the pinned Python 3.9-compatible dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
 HAM10000 is the default dataset:
 
 ```bash

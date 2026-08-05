@@ -1,0 +1,14 @@
+# Reproducible dependency set for Python 3.9-3.11.
+# torch and torchvision must be upgraded as a compatible pair.
+torch==2.2.2
+torchvision==0.17.2
+
+numpy==1.26.4
+pandas==2.2.3
+Pillow==10.4.0
+matplotlib==3.9.4
+scikit-learn==1.5.2
+
+wandb==0.17.6
+opacus==1.5.2
+kagglehub==0.3.13

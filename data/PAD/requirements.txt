@@ -1,1 +1,1 @@
-kagglehub>=0.3.13,<2
+kagglehub==0.3.13
