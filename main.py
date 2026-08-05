@@ -84,6 +84,11 @@ from api.data_preprocessing.ham10000.data_loader import load_partition_data_ham1
 from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
 from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
 from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
+from api.data_preprocessing.pad.data_loader import (
+    PAD_CLASS_NAMES,
+    discover_pad_client_count,
+    load_partition_data_pad,
+)
 
 import matplotlib
 matplotlib.use('Agg')
@@ -140,7 +145,8 @@ def add_args(parser):
         metavar='NAME',
         help=(
             'dataset used for training (default: ham10000). '
-            'Use cifar10, cifar, or cifer for CIFAR-10. '
+            'Supported datasets: ham10000, pad, cifar10, cifar100, cinic10. '
+            'Use cifar, cifer, or cifar10 for CIFAR-10. '
             '--datatset is supported as a backwards-compatible spelling.'
         ),
     )
@@ -269,7 +275,7 @@ def add_args(parser):
                         help='Number of TTA views (1 disables averaging).')
 
     parser.add_argument('--use_titan_aug', action='store_true', default=False,
-                        help='Use TITAN strong-augment pipeline for HAM10000 '
+                        help='Use TITAN strong-augment pipeline for HAM10000/PAD '
                              'training images (Step 4: RandAugment + RandomErasing).')
     parser.add_argument('--titan_aug_image_size', type=int, default=32,
                         help='Image size used by the TITAN augmentation pipeline.')
@@ -280,6 +286,7 @@ def add_args(parser):
 
 HAM10000_ALIASES = {"ham10000", "flower", "flower_framework"}
 CIFAR10_ALIASES = {"cifar10", "cifar", "cifer", "cifer10", "cifar_10", "cifar-10"}
+PAD_ALIASES = {"pad", "pad_ufes_20", "pad-ufes-20", "padufes20"}
 
 
 def normalize_dataset_name(dataset_name):
@@ -288,6 +295,8 @@ def normalize_dataset_name(dataset_name):
         return "ham10000"
     if dataset_key in CIFAR10_ALIASES:
         return "cifar10"
+    if dataset_key in PAD_ALIASES:
+        return "pad"
     return dataset_key
 
 
@@ -318,7 +327,7 @@ def discover_ham10000_client_count(data_dir):
 
 
 def build_criterion(dataset_name, train_loader, num_classes, target_device):
-    if dataset_name != "ham10000":
+    if dataset_name not in {"ham10000", "pad"}:
         return nn.CrossEntropyLoss()
 
     labels = np.asarray(train_loader.dataset.target, dtype=np.int64)
@@ -478,6 +487,18 @@ if args.dataset == "ham10000":
             f"based on the discovered Flower client shards."
         )
         args.client_number = detected_client_number
+elif args.dataset == "pad":
+    args.data_dir, detected_client_number = discover_pad_client_count(args.data_dir)
+    if args.client_number != detected_client_number:
+        print(
+            f"PAD client count auto-adjusted from {args.client_number} to {detected_client_number} "
+            "based on the prepared patient-level client shards."
+        )
+        args.client_number = detected_client_number
+print(
+    f"Selected dataset: {args.dataset} | data directory: {os.path.abspath(args.data_dir)} | "
+    f"clients: {args.client_number}"
+)
 logging.info(args)
 
     
@@ -503,6 +524,8 @@ elif args.dataset == 'cifar100' or args.dataset == 'cinic10':
     class_num = 100
 elif args.dataset == 'ham10000':
     class_num = 7
+elif args.dataset == 'pad':
+    class_num = len(PAD_CLASS_NAMES)
 else:
     raise ValueError(f"Unsupported dataset '{args.dataset}'.")
 
@@ -666,6 +689,8 @@ def load_data(args, dataset_name):
     elif dataset_name == "ham10000":
         data_loader = load_partition_data_ham10000
         args.data_dir = resolve_ham10000_data_dir(args.data_dir)
+    elif dataset_name == "pad":
+        data_loader = load_partition_data_pad
     else:
         raise ValueError(f"Unsupported dataset '{dataset_name}'.")
 
@@ -678,8 +703,8 @@ def load_data(args, dataset_name):
         dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
                    train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
 
-    elif dataset_name == "ham10000":
-        # HAM10000 loader supports TITAN Step-4 strong augmentation
+    elif dataset_name in {"ham10000", "pad"}:
+        # Medical-image loaders support TITAN Step-4 strong augmentation
         # (RandAugment + RandomErasing) via the strong_aug flag.
         train_data_num, test_data_num, train_data_global, test_data_global, \
         train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
@@ -1263,6 +1288,9 @@ def compute_final_classwise_metrics(client_net, server_net, test_loader):
     if args.dataset == "ham10000" and class_num == 7:
         class_labels = list(range(7))
         class_names = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+    elif args.dataset == "pad" and class_num == len(PAD_CLASS_NAMES):
+        class_labels = list(range(len(PAD_CLASS_NAMES)))
+        class_names = list(PAD_CLASS_NAMES)
     else:
         class_labels = list(range(class_num))
         class_names = [str(i) for i in class_labels]

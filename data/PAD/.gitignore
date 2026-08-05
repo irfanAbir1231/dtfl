@@ -1,0 +1,5 @@
+raw/
+processed/*.csv
+processed/*.json
+!processed/.gitkeep
+

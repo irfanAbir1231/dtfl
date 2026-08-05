@@ -31,3 +31,19 @@ python3 main.py --datatset cifer
 
 The CIFAR-10 loader downloads the dataset into `./data` automatically when it
 is not already present.
+
+### PAD-UFES-20
+
+PAD-UFES-20 is a six-class clinical skin-lesion dataset. Download and prepare
+it once before training (the Kaggle archive is approximately 3.61 GB):
+
+```bash
+python3 -m pip install -r data/PAD/requirements.txt
+python3 data/PAD/prepare_pad.py --download
+python3 main.py --dataset pad
+```
+
+The preparation step creates a patient-disjoint 80/20 train/test split and
+eight patient-disjoint, label-skewed federated client shards. HAM10000 remains
+the default when `--dataset` is omitted. See [data/PAD/README.md](data/PAD/README.md)
+for the generated layout and reproducibility details.
