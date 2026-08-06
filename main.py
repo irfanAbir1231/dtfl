@@ -275,8 +275,18 @@ def add_args(parser):
                         help='Number of TTA views (1 disables averaging).')
 
     parser.add_argument('--use_titan_aug', action='store_true', default=False,
-                        help='Use TITAN strong-augment pipeline for HAM10000/PAD '
-                             'training images (Step 4: RandAugment + RandomErasing).')
+                        help='Use the stronger medical-image augmentation pipeline '
+                             'for HAM10000/PAD training images.')
+    parser.add_argument(
+        '--no_pad_balanced_sampling',
+        dest='pad_balanced_sampling',
+        action='store_false',
+        default=True,
+        help=(
+            'Disable PAD inverse-square-root class/patient sampling. Balanced '
+            'sampling is enabled by default to reduce PAD class imbalance.'
+        ),
+    )
     parser.add_argument('--titan_aug_image_size', type=int, default=32,
                         help='Image size used by the TITAN augmentation pipeline.')
 
@@ -704,13 +714,20 @@ def load_data(args, dataset_name):
                    train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
 
     elif dataset_name in {"ham10000", "pad"}:
-        # Medical-image loaders support TITAN Step-4 strong augmentation
-        # (RandAugment + RandomErasing) via the strong_aug flag.
+        # Medical-image loaders expose stronger train-only augmentation through
+        # the common strong_aug flag; PAD additionally supports balanced sampling.
+        medical_loader_options = {
+            "strong_aug": getattr(args, "use_titan_aug", False),
+        }
+        if dataset_name == "pad":
+            medical_loader_options["balanced_sampling"] = getattr(
+                args, "pad_balanced_sampling", True
+            )
         train_data_num, test_data_num, train_data_global, test_data_global, \
         train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
         class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
                                 args.partition_alpha, args.client_number, args.batch_size,
-                                strong_aug=getattr(args, "use_titan_aug", False))
+                                **medical_loader_options)
 
         dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
                    train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]

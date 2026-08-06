@@ -1,17 +1,24 @@
 import glob
+import json
 import logging
+import math
 import os
+import re
+from collections import Counter
 
 import pandas as pd
+import torch
 import torch.utils.data as data
 import torchvision.transforms as transforms
 from PIL import Image
+from torchvision.transforms import InterpolationMode
 
 
 logger = logging.getLogger(__name__)
 
-PAD_IMAGE_SIZE = 32
+PAD_IMAGE_SIZE = 64
 PAD_CLASS_NAMES = ["ACK", "BCC", "MEL", "NEV", "SCC", "SEK"]
+PAD_CLASS_TO_LABEL = {name: index for index, name in enumerate(PAD_CLASS_NAMES)}
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -50,43 +57,103 @@ def resolve_pad_data_dir(data_dir):
 
 def discover_pad_client_count(data_dir):
     dataset_root = resolve_pad_data_dir(data_dir)
-    client_csvs = sorted(
-        glob.glob(os.path.join(dataset_root, "processed", "client_*_train.csv"))
-    )
-    if not client_csvs:
-        raise FileNotFoundError(
-            f"No PAD client shard CSVs found in '{os.path.join(dataset_root, 'processed')}'."
-        )
+    client_csvs = _discover_client_csvs(os.path.join(dataset_root, "processed"))
     return dataset_root, len(client_csvs)
 
 
-def _data_transforms_pad(strong_aug=False):
-    if strong_aug:
-        from utils.augmentation import (
-            build_titan_eval_transform,
-            build_titan_train_transform,
+def _discover_client_csvs(processed_dir):
+    candidates = glob.glob(os.path.join(processed_dir, "client_*_train.csv"))
+    indexed = []
+    for path in candidates:
+        match = re.fullmatch(r"client_(\d+)_train\.csv", os.path.basename(path))
+        if match:
+            indexed.append((int(match.group(1)), path))
+    indexed.sort()
+    client_csvs = [path for _, path in indexed]
+    if not client_csvs:
+        raise FileNotFoundError(
+            f"No PAD client shard CSVs found in '{processed_dir}'."
         )
+    identifiers = [identifier for identifier, _ in indexed]
+    expected = list(range(1, len(indexed) + 1))
+    if identifiers != expected:
+        raise ValueError(
+            f"PAD client shard IDs must be contiguous {expected}, found {identifiers}."
+        )
+    return client_csvs
 
-        train_transform = build_titan_train_transform(PAD_IMAGE_SIZE, strong=True)
-        test_transform = build_titan_eval_transform(PAD_IMAGE_SIZE)
-    else:
-        # Match the active HAM10000 image pipeline for a controlled comparison.
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((PAD_IMAGE_SIZE, PAD_IMAGE_SIZE)),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomVerticalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-            ]
+
+def _load_pad_normalization(dataset_root):
+    summary_path = os.path.join(
+        dataset_root, "processed", "PAD_preprocessing_summary.json"
+    )
+    if not os.path.isfile(summary_path):
+        logger.warning("PAD preprocessing summary is missing; using ImageNet normalization.")
+        return IMAGENET_MEAN, IMAGENET_STD
+    try:
+        with open(summary_path, encoding="utf-8") as summary_file:
+            normalization = json.load(summary_file)["normalization"]
+        mean = [float(value) for value in normalization["mean"]]
+        std = [float(value) for value in normalization["std"]]
+        if (
+            len(mean) != 3
+            or len(std) != 3
+            or not all(math.isfinite(value) for value in mean + std)
+            or not all(value > 0 for value in std)
+        ):
+            raise ValueError("normalization values must be three finite RGB values")
+        return mean, std
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid PAD normalization metadata in '{summary_path}': {exc}"
+        ) from exc
+
+
+def _data_transforms_pad(strong_aug=False, mean=None, std=None):
+    """PAD-specific augmentation that preserves small clinical lesion detail."""
+    mean = IMAGENET_MEAN if mean is None else mean
+    std = IMAGENET_STD if std is None else std
+    fill = tuple(round(channel * 255) for channel in mean)
+    crop_scale = (0.78, 1.0) if strong_aug else (0.90, 1.0)
+    rotation = 20 if strong_aug else 10
+    jitter = (
+        transforms.ColorJitter(brightness=0.20, contrast=0.20, saturation=0.12, hue=0.02)
+        if strong_aug
+        else transforms.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.05)
+    )
+    train_ops = [
+        transforms.RandomResizedCrop(
+            PAD_IMAGE_SIZE,
+            scale=crop_scale,
+            ratio=(0.95, 1.05),
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        ),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(
+            rotation, interpolation=InterpolationMode.BILINEAR, fill=fill
+        ),
+        transforms.RandomApply([jitter], p=0.8 if strong_aug else 0.3),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ]
+    if strong_aug:
+        train_ops.append(
+            transforms.RandomErasing(p=0.15, scale=(0.02, 0.08), ratio=(0.5, 2.0))
         )
-        test_transform = transforms.Compose(
-            [
-                transforms.Resize((PAD_IMAGE_SIZE, PAD_IMAGE_SIZE)),
-                transforms.ToTensor(),
-                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-            ]
-        )
+    train_transform = transforms.Compose(train_ops)
+    test_transform = transforms.Compose(
+        [
+            transforms.Resize(
+                (PAD_IMAGE_SIZE, PAD_IMAGE_SIZE),
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
+    )
     return train_transform, test_transform
 
 
@@ -98,7 +165,40 @@ def _read_metadata(csv_path):
         raise ValueError(
             f"PAD metadata file '{csv_path}' is missing columns: {sorted(missing)}"
         )
+    if dataframe.empty:
+        raise ValueError(f"PAD metadata file '{csv_path}' contains no rows.")
+    for column in required:
+        values = dataframe[column]
+        if values.isna().any() or values.astype(str).str.strip().eq("").any():
+            raise ValueError(
+                f"PAD metadata file '{csv_path}' contains a blank '{column}' value."
+            )
+    if dataframe["img_id"].duplicated().any():
+        duplicates = dataframe.loc[dataframe["img_id"].duplicated(), "img_id"].tolist()
+        raise ValueError(
+            f"PAD metadata file '{csv_path}' contains duplicate img_id values: {duplicates[:5]}"
+        )
     return dataframe
+
+
+def _balanced_sampler(dataframe, seed_key):
+    """Moderately rebalance diagnoses while reducing repeated-patient weight."""
+    class_counts = Counter(dataframe["label"].astype(int))
+    patient_counts = Counter(dataframe["patient_id"].astype(str))
+    weights = [
+        1.0
+        / math.sqrt(class_counts[int(row.label)])
+        / math.sqrt(patient_counts[str(row.patient_id)])
+        for row in dataframe.itertuples()
+    ]
+    generator = torch.Generator()
+    generator.manual_seed(42 + sum(seed_key.encode("utf-8")))
+    return data.WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+        generator=generator,
+    )
 
 
 class PADDataset(data.Dataset):
@@ -134,18 +234,27 @@ def get_dataloader_pad(
     train_csv,
     test_csv,
     strong_aug=False,
+    balanced_sampling=True,
 ):
-    train_transform, test_transform = _data_transforms_pad(strong_aug=strong_aug)
-    train_dataset = PADDataset(
-        _read_metadata(train_csv), data_dir, transform=train_transform
+    mean, std = _load_pad_normalization(data_dir)
+    train_transform, test_transform = _data_transforms_pad(
+        strong_aug=strong_aug, mean=mean, std=std
     )
+    train_frame = _read_metadata(train_csv)
+    train_dataset = PADDataset(train_frame, data_dir, transform=train_transform)
     test_dataset = PADDataset(
         _read_metadata(test_csv), data_dir, transform=test_transform
+    )
+    sampler = (
+        _balanced_sampler(train_frame, os.path.basename(train_csv))
+        if balanced_sampling
+        else None
     )
     train_loader = data.DataLoader(
         train_dataset,
         batch_size=train_batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         drop_last=False,
     )
     test_loader = data.DataLoader(
@@ -165,14 +274,15 @@ def load_partition_data_pad(
     client_number,
     batch_size,
     strong_aug=False,
+    balanced_sampling=True,
 ):
     # PAD shards are created offline at patient level. The arguments remain in
     # the common loader signature for compatibility with main.py.
-    del dataset, partition_method, partition_alpha
+    del dataset, partition_method
 
     dataset_root = resolve_pad_data_dir(data_dir)
     processed_dir = os.path.join(dataset_root, "processed")
-    client_csvs = sorted(glob.glob(os.path.join(processed_dir, "client_*_train.csv")))
+    client_csvs = _discover_client_csvs(processed_dir)
     if client_number != len(client_csvs):
         raise ValueError(
             f"Requested {client_number} PAD clients, but found {len(client_csvs)} "
@@ -189,6 +299,39 @@ def load_partition_data_pad(
         raise ValueError(
             f"PAD training labels must be {expected_labels}, found {class_labels}."
         )
+    test_labels = sorted(test_frame["label"].astype(int).unique().tolist())
+    if test_labels != expected_labels:
+        raise ValueError(
+            f"PAD test labels must be {expected_labels}, found {test_labels}."
+        )
+    for split_name, split_frame in (("training", train_frame), ("test", test_frame)):
+        mapped_labels = split_frame["diagnostic"].map(PAD_CLASS_TO_LABEL)
+        if mapped_labels.isna().any() or not mapped_labels.astype(int).equals(
+            split_frame["label"].astype(int)
+        ):
+            raise ValueError(
+                f"PAD diagnostic-to-label mapping is inconsistent in {split_name} metadata."
+            )
+    train_patients = set(train_frame["patient_id"].astype(str))
+    test_patients = set(test_frame["patient_id"].astype(str))
+    if train_patients & test_patients:
+        raise ValueError("PAD patient leakage detected between train and test metadata.")
+    if set(train_frame["img_id"].astype(str)) & set(test_frame["img_id"].astype(str)):
+        raise ValueError("PAD image leakage detected between train and test metadata.")
+
+    summary_path = os.path.join(processed_dir, "PAD_preprocessing_summary.json")
+    if os.path.isfile(summary_path):
+        with open(summary_path, encoding="utf-8") as summary_file:
+            prepared_alpha = json.load(summary_file).get("partition_alpha")
+        if prepared_alpha is not None and not math.isclose(
+            float(prepared_alpha), float(partition_alpha), rel_tol=0.0, abs_tol=1e-12
+        ):
+            logger.warning(
+                "PAD shards were prepared with alpha=%s, but runtime requested alpha=%s. "
+                "Re-run prepare_pad.py to change the offline patient partition.",
+                prepared_alpha,
+                partition_alpha,
+            )
 
     train_data_global, test_data_global = get_dataloader_pad(
         dataset_root,
@@ -197,15 +340,31 @@ def load_partition_data_pad(
         train_csv,
         test_csv,
         strong_aug=strong_aug,
+        balanced_sampling=balanced_sampling,
     )
     train_data_num = 0
     test_data_num = len(test_frame)
     data_local_num_dict = {}
     train_data_local_dict = {}
     test_data_local_dict = {}
+    shard_image_ids = set()
+    patient_owners = {}
 
     for client_idx, client_csv in enumerate(client_csvs):
         client_frame = _read_metadata(client_csv)
+        client_image_ids = set(client_frame["img_id"].astype(str))
+        overlap = shard_image_ids & client_image_ids
+        if overlap:
+            raise ValueError(
+                f"PAD images occur in multiple client shards: {sorted(overlap)[:5]}"
+            )
+        shard_image_ids.update(client_image_ids)
+        for patient_id in set(client_frame["patient_id"].astype(str)):
+            if patient_id in patient_owners:
+                raise ValueError(
+                    f"PAD patient '{patient_id}' occurs in multiple client shards."
+                )
+            patient_owners[patient_id] = client_idx
         local_data_num = len(client_frame)
         train_data_num += local_data_num
         data_local_num_dict[client_idx] = local_data_num
@@ -216,6 +375,7 @@ def load_partition_data_pad(
             client_csv,
             test_csv,
             strong_aug=strong_aug,
+            balanced_sampling=balanced_sampling,
         )
         train_data_local_dict[client_idx] = train_data_local
         test_data_local_dict[client_idx] = test_data_global
@@ -227,10 +387,11 @@ def load_partition_data_pad(
             len(test_data_global),
         )
 
-    if train_data_num != len(train_frame):
+    expected_train_ids = set(train_frame["img_id"].astype(str))
+    if train_data_num != len(train_frame) or shard_image_ids != expected_train_ids:
         raise RuntimeError(
-            f"PAD client shards contain {train_data_num} rows, but the global train split "
-            f"contains {len(train_frame)} rows."
+            "PAD client shards do not exactly cover the global train split: "
+            f"{train_data_num} shard rows versus {len(train_frame)} global rows."
         )
 
     return (

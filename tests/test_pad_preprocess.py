@@ -5,6 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
+from torch.utils.data import WeightedRandomSampler
+
+from api.data_preprocessing.pad.data_loader import get_dataloader_pad
+
 
 PREPARE_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "PAD" / "prepare_pad.py"
@@ -32,7 +37,12 @@ class PADPreprocessingTest(unittest.TestCase):
             images_for_patient = 2 if patient_number % 9 == 0 else 1
             for image_number in range(images_for_patient):
                 image_id = f"PAT_{patient_number}_{image_number}.png"
-                (raw_dir / image_id).touch()
+                value = patient_number * 2 + image_number
+                Image.new(
+                    "RGB",
+                    (12, 12),
+                    (value % 256, (value * 3) % 256, (value * 7) % 256),
+                ).save(raw_dir / image_id)
                 rows.append(
                     {
                         "patient_id": f"PAT_{patient_number}",
@@ -93,13 +103,82 @@ class PADPreprocessingTest(unittest.TestCase):
             )
             self.assertEqual(len(train_rows), len(client_rows))
             self.assertEqual(6, len(summary["label_mapping"]))
+            self.assertEqual(len(source_rows), summary["source_images"])
+            self.assertEqual(0, summary["duplicate_audit"]["excluded_images"])
+            self.assertEqual(3, len(summary["normalization"]["mean"]))
+            self.assertTrue(all(value > 0 for value in summary["normalization"]["std"]))
 
             with (processed / "PAD_preprocessing_summary.json").open() as summary_file:
                 saved_summary = json.load(summary_file)
             self.assertEqual(summary["train_images"], saved_summary["train_images"])
             self.assertEqual(summary["test_images"], saved_summary["test_images"])
 
+            train_loader, test_loader = get_dataloader_pad(
+                str(root),
+                train_batch_size=8,
+                test_batch_size=8,
+                train_csv=str(processed / "PAD_metadata_train.csv"),
+                test_csv=str(processed / "PAD_metadata_test.csv"),
+            )
+            train_images, train_labels = next(iter(train_loader))
+            test_images, test_labels = next(iter(test_loader))
+            self.assertIsInstance(train_loader.sampler, WeightedRandomSampler)
+            self.assertEqual((3, 64, 64), tuple(train_images.shape[1:]))
+            self.assertEqual((3, 64, 64), tuple(test_images.shape[1:]))
+            self.assertEqual(train_images.shape[0], train_labels.shape[0])
+            self.assertEqual(test_images.shape[0], test_labels.shape[0])
+
+    def test_conflicting_exact_duplicate_images_are_excluded(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            source_rows = self._make_synthetic_dataset(root)
+            ack = next(row for row in source_rows if row["diagnostic"] == "ACK")
+            bcc = next(row for row in source_rows if row["diagnostic"] == "BCC")
+            image_dir = root / "raw" / "imgs_part_1" / "imgs_part_1"
+            (image_dir / bcc["img_id"]).write_bytes(
+                (image_dir / ack["img_id"]).read_bytes()
+            )
+
+            summary = prepare_pad.prepare_dataset(
+                root,
+                client_count=4,
+                test_fraction=0.2,
+                alpha=0.5,
+                seed=42,
+                strict=False,
+            )
+
+            with (root / "processed" / "PAD_metadata_preprocessed.csv").open(
+                newline=""
+            ) as csv_file:
+                retained_ids = {row["img_id"] for row in csv.DictReader(csv_file)}
+            self.assertNotIn(ack["img_id"], retained_ids)
+            self.assertNotIn(bcc["img_id"], retained_ids)
+            self.assertEqual(
+                1, summary["duplicate_audit"]["conflicting_duplicate_groups"]
+            )
+            self.assertEqual(2, summary["duplicate_audit"]["conflicting_images_removed"])
+
+    def test_stale_client_shards_are_removed(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            self._make_synthetic_dataset(root)
+            processed = root / "processed"
+            processed.mkdir()
+            (processed / "client_99_train.csv").write_text("stale\n", encoding="utf-8")
+
+            prepare_pad.prepare_dataset(
+                root,
+                client_count=4,
+                test_fraction=0.2,
+                alpha=0.5,
+                seed=42,
+                strict=False,
+            )
+
+            self.assertFalse((processed / "client_99_train.csv").exists())
+            self.assertEqual(4, len(list(processed.glob("client_*_train.csv"))))
+
 
 if __name__ == "__main__":
     unittest.main()
-
