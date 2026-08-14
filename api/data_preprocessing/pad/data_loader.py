@@ -16,7 +16,7 @@ from torchvision.transforms import InterpolationMode
 
 logger = logging.getLogger(__name__)
 
-PAD_IMAGE_SIZE = 64
+PAD_IMAGE_SIZE = 32
 PAD_CLASS_NAMES = ["ACK", "BCC", "MEL", "NEV", "SCC", "SEK"]
 PAD_CLASS_TO_LABEL = {name: index for index, name in enumerate(PAD_CLASS_NAMES)}
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -84,65 +84,67 @@ def _discover_client_csvs(processed_dir):
 
 
 def _load_pad_normalization(dataset_root):
-    summary_path = os.path.join(
-        dataset_root, "processed", "PAD_preprocessing_summary.json"
-    )
-    if not os.path.isfile(summary_path):
-        logger.warning("PAD preprocessing summary is missing; using ImageNet normalization.")
-        return IMAGENET_MEAN, IMAGENET_STD
-    try:
-        with open(summary_path, encoding="utf-8") as summary_file:
-            normalization = json.load(summary_file)["normalization"]
-        mean = [float(value) for value in normalization["mean"]]
-        std = [float(value) for value in normalization["std"]]
-        if (
-            len(mean) != 3
-            or len(std) != 3
-            or not all(math.isfinite(value) for value in mean + std)
-            or not all(value > 0 for value in std)
-        ):
-            raise ValueError("normalization values must be three finite RGB values")
-        return mean, std
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"Invalid PAD normalization metadata in '{summary_path}': {exc}"
-        ) from exc
+    """Always return ImageNet normalization to match HAM10000's pipeline.
+
+    PAD-specific statistics (computed at 64×64) introduced a domain shift
+    relative to the ResNet model that was designed around ImageNet-normalised
+    32×32 inputs.  Using the same normalisation as HAM10000 closes this gap.
+    """
+    return IMAGENET_MEAN, IMAGENET_STD
 
 
 def _data_transforms_pad(strong_aug=False, mean=None, std=None):
-    """PAD-specific augmentation that preserves small clinical lesion detail."""
+    """Augmentation pipeline aligned with HAM10000 but stronger for PAD's
+    extreme data scarcity (1,811 train images vs HAM's 7,991).
+
+    Key differences from the old pipeline:
+    - Image size 32×32 (matching HAM10000 and the ResNet architecture)
+    - Aggressive geometric augmentation (rotation ±30°, affine translate/scale)
+    - Stronger colour jitter to handle PAD's 3 different acquisition sources
+    - GaussianBlur and RandomGrayscale for regularisation
+    - RandomErasing for occlusion robustness
+    """
     mean = IMAGENET_MEAN if mean is None else mean
     std = IMAGENET_STD if std is None else std
     fill = tuple(round(channel * 255) for channel in mean)
-    crop_scale = (0.78, 1.0) if strong_aug else (0.90, 1.0)
-    rotation = 20 if strong_aug else 10
-    jitter = (
-        transforms.ColorJitter(brightness=0.20, contrast=0.20, saturation=0.12, hue=0.02)
-        if strong_aug
-        else transforms.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.05)
-    )
+
+    # --- Train transforms ------------------------------------------------
     train_ops = [
-        transforms.RandomResizedCrop(
-            PAD_IMAGE_SIZE,
-            scale=crop_scale,
-            ratio=(0.95, 1.05),
+        transforms.Resize(
+            (PAD_IMAGE_SIZE, PAD_IMAGE_SIZE),
             interpolation=InterpolationMode.BILINEAR,
             antialias=True,
         ),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
         transforms.RandomRotation(
-            rotation, interpolation=InterpolationMode.BILINEAR, fill=fill
+            30, interpolation=InterpolationMode.BILINEAR, fill=fill
         ),
-        transforms.RandomApply([jitter], p=0.8 if strong_aug else 0.3),
+        transforms.RandomAffine(
+            degrees=0,
+            translate=(0.1, 0.1),
+            scale=(0.85, 1.15),
+            interpolation=InterpolationMode.BILINEAR,
+            fill=fill,
+        ),
+        transforms.RandomApply(
+            [transforms.ColorJitter(
+                brightness=0.3, contrast=0.3, saturation=0.2, hue=0.04
+            )],
+            p=0.8,
+        ),
+        transforms.RandomGrayscale(p=0.05),
+        transforms.RandomApply(
+            [transforms.GaussianBlur(kernel_size=3)],
+            p=0.2,
+        ),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
     ]
-    if strong_aug:
-        train_ops.append(
-            transforms.RandomErasing(p=0.15, scale=(0.02, 0.08), ratio=(0.5, 2.0))
-        )
     train_transform = transforms.Compose(train_ops)
+
+    # --- Test transforms (deterministic, no augmentation) ----------------
     test_transform = transforms.Compose(
         [
             transforms.Resize(
@@ -182,12 +184,21 @@ def _read_metadata(csv_path):
 
 
 def _balanced_sampler(dataframe, seed_key):
-    """Moderately rebalance diagnoses while reducing repeated-patient weight."""
+    """Aggressively rebalance diagnoses for PAD's extreme class imbalance.
+
+    PAD has up to 16:1 class imbalance (BCC=663 vs MEL=42).  The old
+    ``1/sqrt(count)`` weighting was too gentle — it only provided ~4:1
+    rebalancing, causing the model to collapse minority classes.  Using
+    ``1/count`` gives full inverse-frequency rebalancing so that each
+    class is sampled with roughly equal probability per epoch.  Patient
+    de-weighting is kept at ``1/sqrt`` to reduce repeated-patient bias
+    without completely suppressing multi-lesion patients.
+    """
     class_counts = Counter(dataframe["label"].astype(int))
     patient_counts = Counter(dataframe["patient_id"].astype(str))
     weights = [
         1.0
-        / math.sqrt(class_counts[int(row.label)])
+        / class_counts[int(row.label)]
         / math.sqrt(patient_counts[str(row.patient_id)])
         for row in dataframe.itertuples()
     ]
@@ -221,7 +232,15 @@ class PADDataset(data.Dataset):
             raise FileNotFoundError(f"PAD image not found: '{image_path}'")
 
         with Image.open(image_path) as image:
-            image = image.convert("RGB")
+            # Composite RGBA onto white background to preserve information
+            # that would otherwise be lost (alpha=0 regions become black
+            # with the default .convert("RGB")).
+            if image.mode == "RGBA":
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                background.paste(image, mask=image.split()[3])
+                image = background
+            else:
+                image = image.convert("RGB")
             if self.transform is not None:
                 image = self.transform(image)
         return image, int(row["label"])
