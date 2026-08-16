@@ -52,7 +52,7 @@ python3 main.py --dataset pad
 The preparation step audits contradictory exact duplicates, creates a
 patient-disjoint and acquisition-source-aware 80/20 train/test split, computes
 PAD-specific RGB statistics, and creates eight size-constrained,
-patient-disjoint federated client shards. PAD training uses 64x64 inputs and
+patient-disjoint federated client shards. PAD training uses 32x32 inputs and
 moderate balanced sampling by default. HAM10000 remains unchanged and is the
 default when `--dataset` is omitted. See
 [data/PAD/README.md](data/PAD/README.md) for details.

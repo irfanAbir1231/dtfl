@@ -40,7 +40,7 @@ partition remains deterministic and non-IID with Dirichlet alpha 0.5, but it
 now constrains shard-size imbalance and prevents rare classes from collapsing
 to a single example whenever the class count permits.
 
-At runtime, PAD uses 64x64 inputs (HAM10000 is unchanged), PAD training-set RGB
+At runtime, PAD uses 32x32 inputs (HAM10000 is unchanged), PAD training-set RGB
 normalization, train-only lesion-preserving augmentation, and moderate
 inverse-square-root class/patient sampling. The latter is enabled by default
 and can be disabled for an ablation with `--no_pad_balanced_sampling`.

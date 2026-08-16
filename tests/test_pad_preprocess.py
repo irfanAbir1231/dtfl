@@ -123,8 +123,8 @@ class PADPreprocessingTest(unittest.TestCase):
             train_images, train_labels = next(iter(train_loader))
             test_images, test_labels = next(iter(test_loader))
             self.assertIsInstance(train_loader.sampler, WeightedRandomSampler)
-            self.assertEqual((3, 64, 64), tuple(train_images.shape[1:]))
-            self.assertEqual((3, 64, 64), tuple(test_images.shape[1:]))
+            self.assertEqual((3, 32, 32), tuple(train_images.shape[1:]))
+            self.assertEqual((3, 32, 32), tuple(test_images.shape[1:]))
             self.assertEqual(train_images.shape[0], train_labels.shape[0])
             self.assertEqual(test_images.shape[0], test_labels.shape[0])
 

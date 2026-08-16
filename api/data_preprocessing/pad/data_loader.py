@@ -7,8 +7,11 @@ import re
 from collections import Counter
 
 import pandas as pd
+# pyrefly: ignore [missing-import]
 import torch
+# pyrefly: ignore [missing-import]
 import torch.utils.data as data
+# pyrefly: ignore [missing-import]
 import torchvision.transforms as transforms
 from PIL import Image
 # pyrefly: ignore [missing-import]
