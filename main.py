@@ -512,14 +512,44 @@ print(
 logging.info(args)
 
     
-wandb.init(
-    mode="online",
-    project="DTFL",
-    name="DTFL",# + str(args.tier),
-    config=args,
-    # tags="Tier1_5",
-    # group="ResNet56",
-)
+# ---------------------------------------------------------------------------
+# FIX 5 (part A): Make wandb.init resilient to socket / permission failures.
+# If the process cannot bind a socket (as seen in tea_debug.log), fall back to
+# offline mode so training can still complete all 250 rounds.
+# ---------------------------------------------------------------------------
+try:
+    wandb.init(
+        mode="online",
+        project="DTFL",
+        name="DTFL",  # + str(args.tier),
+        config=args,
+        # tags="Tier1_5",
+        # group="ResNet56",
+    )
+except Exception as _wandb_init_exc:
+    logging.warning(
+        f"[WandB] online init failed ({_wandb_init_exc}); falling back to offline mode."
+    )
+    wandb.init(
+        mode="offline",
+        project="DTFL",
+        name="DTFL",
+        config=args,
+    )
+
+
+def safe_wandb_log(metrics: dict, commit: bool = False) -> None:
+    """Log metrics to W&B, silently catching any connection/socket errors.
+
+    WandB can raise RuntimeError / ConnectionError when its internal gRPC
+    server fails to bind (observed in tea_debug.log).  Wrapping every
+    ``commit=True`` call in this helper ensures those failures are logged as
+    warnings rather than crashing the training loop.
+    """
+    try:
+        wandb.log(metrics, commit=commit)
+    except Exception as _wlog_exc:  # noqa: BLE001
+        logging.warning(f"[WandB] wandb.log failed (non-fatal): {_wlog_exc}")
 
 
 
@@ -1173,8 +1203,15 @@ def evaluate_global_split_model(client_net, server_net, test_loader, round_idx, 
             total_correct += logits.argmax(dim=1).eq(labels).sum().item()
             total_samples += batch_size
 
+    # FIX 3: Do not raise here — an empty test loader on a given round
+    # (e.g. PAD dataset with an unusual split) must not crash the entire run.
+    # Log a warning and return so training continues to the next round.
     if total_samples == 0:
-        raise RuntimeError("Global evaluation received an empty test loader.")
+        logging.warning(
+            f"[Eval] Round {round_idx}: global test loader is empty — "
+            "skipping evaluation this round."
+        )
+        return None, None
 
     loss_avg_all_user = total_loss / total_samples
     acc_avg_all_user = 100.0 * total_correct / total_samples
@@ -1926,303 +1963,325 @@ rounds_completed_final = 0
 
 # Main loop over rounds
 for iter in range(epochs):
-    round_wall_start = time.time()
-    privacy_round_protected_batches = 0
+    try:
+        round_wall_start = time.time()
+        privacy_round_protected_batches = 0
 
-    # -------------------------------------------------------------------
-    # Privacy: adaptive noise schedule  (privacy-implementation-plan.md §2)
-    # Compute sigma_t for this round: sigma_t = max(sigma_min, sigma0 * decay^t)
-    # sigma_t is declared global so Client.train() can read it without passing
-    # it as a parameter (consistent with how other globals like `new_lr` are used).
-    # -------------------------------------------------------------------
-    sigma_t = noise_schedule(iter, noise_sigma0, noise_sigma_min, noise_decay)  # noqa: F811
-    if privacy_enable:
-        wandb.log({"Privacy/sigma_t": sigma_t, "epoch": iter}, commit=False)
-    if iter == int(50): # here we can change how the enviroement randomly change
-        active_clients_per_round_final.append(0)
-        round_time_seconds_final.append(time.time() - round_wall_start)
-        rounds_completed_final += 1
-        continue
-        delay_coefficient[0] = delay_coefficient_list[2]
-        net_speed[0] = net_speed_list[2]
-        delay_coefficient[1] = delay_coefficient_list[4]
-        net_speed[1] = net_speed_list[4]
-        delay_coefficient[2] = delay_coefficient_list[4]
-        net_speed[2] = net_speed_list[4]
-        delay_coefficient[3] = delay_coefficient_list[0]
-        net_speed[3] = net_speed_list[0]
-        delay_coefficient[4] = delay_coefficient_list[0]
-        net_speed[4] = net_speed_list[0]
-        delay_coefficient[5] = delay_coefficient_list[4]
-        net_speed[5] = net_speed_list[4]
-        delay_coefficient[6] = delay_coefficient_list[4]
-        net_speed[6] = net_speed_list[4]
-        delay_coefficient[7] = delay_coefficient_list[0]
-        net_speed[7] = net_speed_list[0]
-        delay_coefficient[8] = delay_coefficient_list[1]
-        net_speed[8] = net_speed_list[1]
-        delay_coefficient[9] = delay_coefficient_list[1]
-        net_speed[9] = net_speed_list[1]
+        # -------------------------------------------------------------------
+        # Privacy: adaptive noise schedule  (privacy-implementation-plan.md §2)
+        # Compute sigma_t for this round: sigma_t = max(sigma_min, sigma0 * decay^t)
+        # sigma_t is declared global so Client.train() can read it without passing
+        # it as a parameter (consistent with how other globals like `new_lr` are used).
+        # -------------------------------------------------------------------
+        sigma_t = noise_schedule(iter, noise_sigma0, noise_sigma_min, noise_decay)  # noqa: F811
+        if privacy_enable:
+            wandb.log({"Privacy/sigma_t": sigma_t, "epoch": iter}, commit=False)
+        # FIX 1: Environment heterogeneity change at round 50.
+        # The `continue` was previously placed *before* the delay/net_speed updates,
+        # making them dead code and skipping round 50's training entirely.
+        # Fix: apply the environment updates first, then let the round train normally.
+        if iter == int(50):  # here we can change how the environment randomly changes
+            delay_coefficient[0] = delay_coefficient_list[2]
+            net_speed[0] = net_speed_list[2]
+            delay_coefficient[1] = delay_coefficient_list[4]
+            net_speed[1] = net_speed_list[4]
+            delay_coefficient[2] = delay_coefficient_list[4]
+            net_speed[2] = net_speed_list[4]
+            delay_coefficient[3] = delay_coefficient_list[0]
+            net_speed[3] = net_speed_list[0]
+            delay_coefficient[4] = delay_coefficient_list[0]
+            net_speed[4] = net_speed_list[0]
+            delay_coefficient[5] = delay_coefficient_list[4]
+            net_speed[5] = net_speed_list[4]
+            delay_coefficient[6] = delay_coefficient_list[4]
+            net_speed[6] = net_speed_list[4]
+            delay_coefficient[7] = delay_coefficient_list[0]
+            net_speed[7] = net_speed_list[0]
+            delay_coefficient[8] = delay_coefficient_list[1]
+            net_speed[8] = net_speed_list[1]
+            delay_coefficient[9] = delay_coefficient_list[1]
+            net_speed[9] = net_speed_list[1]
+            print(f"[Round {iter}] Environment profile updated (heterogeneity shift).")
 
                
         
     
-    # Initialize empty lists for client weights
-    w_locals_client = []
-    w_locals_client_tier = {}
+        # Initialize empty lists for client weights
+        w_locals_client = []
+        w_locals_client_tier = {}
     
-    # Initialize a dictionary to store client weights based on their tiers
-    w_locals_client_tier = {i: [] for i in range(1, num_tiers+1)}
+        # Initialize a dictionary to store client weights based on their tiers
+        w_locals_client_tier = {i: [] for i in range(1, num_tiers+1)}
     
-    # Initialize a numpy array to store client time
-    client_observed_time = np.zeros(num_users)
+        # Initialize a numpy array to store client time
+        client_observed_time = np.zeros(num_users)
     
-    processes = []
+        processes = []
     
-    simulated_delay= np.zeros(num_users)
+        simulated_delay= np.zeros(num_users)
 
-    # ------------------------------------------------------------------
-    # DEATS dropout handling (FIX)
+        # ------------------------------------------------------------------
+        # DEATS dropout handling (FIX)
   
-    if deats_scheduler is not None:
-        active_idxs_users = [i for i in idxs_users if deats_scheduler.battery.is_alive(i)]
-        dropped_idxs_users = [i for i in idxs_users if not deats_scheduler.battery.is_alive(i)]
-    else:
-        active_idxs_users = list(idxs_users)
-        dropped_idxs_users = []
-
-    # Log dropped-out clients (battery at safety floor) for this round
-    for idx in dropped_idxs_users:
-        print(
-            f"Client {idx} skipped — battery at safety floor "
-            f"({args.deats_battery_min}%)"
-        )
-
-        # Recharge the idle client so it can rejoin in a later round, instead
-        # of being lost permanently for the rest of training.
-        deats_scheduler.battery.recharge_idle(idx)
-
-        wandb.log({
-            f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
-            f"Client{idx}_DroppedOut": 1,
-            "epoch": iter,
-        }, commit=False)
-
-    # Federation this round completes based on the clients that train.
-    # `m` is read as a global inside train_server's federation trigger.
-    m = len(active_idxs_users)
-
-    # If every sampled client has dropped out, there is nothing to train or
-    # aggregate this round — skip safely instead of deadlocking the loop.
-    if m == 0:
-        print(f"Round {iter}: all sampled clients dropped out — skipping round.")
-        wandb.log({"Active_Clients": 0, "epoch": iter}, commit=True)
-        active_clients_per_round_final.append(0)
-        round_time_seconds_final.append(time.time() - round_wall_start)
-        rounds_completed_final += 1
-        continue
-
-    wandb.log({"Active_Clients": m, "epoch": iter}, commit=False)
-
-    for idx in active_idxs_users:
-        # Log the client tier for each client in WandB
-        wandb.log({"Client{}_Tier".format(idx): num_tiers - client_tier[idx] + 1, "epoch": iter}, commit=False) # tier 1 smallest model
-        
-        
-        data_server_to_client = calculate_data_size(w_glob_client_tier[client_tier[idx]])
-        simulated_delay[idx] = data_server_to_client / net_speed[idx]
-            
-            
-        client_model_parameter_data_size = 0
-        time_train_test_s = time.time()
-        net_glob_client = net_model_client_tier[client_tier[idx]]
-        w_glob_client_tier[client_tier[idx]] = net_glob_client_tier[client_tier[idx]].state_dict() # may be I can eliminate this line
-        local = Client(net_glob_client, idx, lr, device, dataset_train = dataset_train, dataset_test = dataset_test, idxs = [], idxs_test = [])
-            
-
-        # Training ------------------
-        [w_client, duration, client_intermediate_data_size] = local.train(
-            net=copy.deepcopy(net_glob_client).to(device),
-            round_idx=iter,
-        )
-            
-        w_locals_client.append(copy.deepcopy(w_client))
-        w_locals_client_tier[client_tier[idx]].append(copy.deepcopy(w_client))
-        
-        client_observed_time[idx] = duration
-        
-        
-        client_model_parameter_data_size = calculate_data_size(w_client)
-        model_parameter_data_size += client_model_parameter_data_size         
-        
-        data_transmitted_client = client_intermediate_data_size + client_model_parameter_data_size
-        
-        # add to dic last observation
-        data_transmitted_client_all[idx] = data_transmitted_client
-        
-        simulated_delay[idx] += compute_delay(data_transmitted_client, net_speed[idx]
-                                              , delay_coefficient[idx], duration) # this is simulated delay
-
         if deats_scheduler is not None:
-            energy_drain = deats_scheduler.battery.drain(
-                client_id=idx,
-                duration=duration,
-                data_transmitted=data_transmitted_client,
-                net_speed=net_speed[idx],
-                delay_coefficient=delay_coefficient[idx],
-                code_tier=client_tier[idx],
-                num_tiers=num_tiers,
+            active_idxs_users = [i for i in idxs_users if deats_scheduler.battery.is_alive(i)]
+            dropped_idxs_users = [i for i in idxs_users if not deats_scheduler.battery.is_alive(i)]
+        else:
+            active_idxs_users = list(idxs_users)
+            dropped_idxs_users = []
+
+        # Log dropped-out clients (battery at safety floor) for this round
+        for idx in dropped_idxs_users:
+            print(
+                f"Client {idx} skipped — battery at safety floor "
+                f"({args.deats_battery_min}%)"
             )
-            deats_scheduler.update_ema(idx, energy_drain)
-            deats_scheduler.record_relative_energy(idx, energy_drain)
+
+            # Recharge the idle client so it can rejoin in a later round, instead
+            # of being lost permanently for the rest of training.
+            deats_scheduler.battery.recharge_idle(idx)
+
             wandb.log({
                 f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
-                f"Client{idx}_EnergyDrain": energy_drain,
-                f"Client{idx}_EMA_Energy": deats_scheduler.battery.clients[idx].ema_energy_rate,
+                f"Client{idx}_DroppedOut": 1,
                 "epoch": iter,
             }, commit=False)
 
-        wandb.log({"Client{}_Total_Delay".format(idx): simulated_delay[idx], "epoch": iter}, commit=False)
+        # Federation this round completes based on the clients that train.
+        # `m` is read as a global inside train_server's federation trigger.
+        m = len(active_idxs_users)
 
-    if privacy_enable and privacy_round_protected_batches > 0:
-        cumulative_q = min(args.batch_size / max(avg_dataset, 1), 1.0)
-        privacy_rdp_events.append((cumulative_q, sigma_t, privacy_round_protected_batches))
+        # If every sampled client has dropped out, there is nothing to train or
+        # aggregate this round — skip safely instead of deadlocking the loop.
+        if m == 0:
+            print(f"Round {iter}: all sampled clients dropped out — skipping round.")
+            wandb.log({"Active_Clients": 0, "epoch": iter}, commit=True)
+            active_clients_per_round_final.append(0)
+            round_time_seconds_final.append(time.time() - round_wall_start)
+            rounds_completed_final += 1
+            continue
 
-    server_wait_first_to_last_client = (max(simulated_delay * client_epoch) - min(simulated_delay * client_epoch))
-    training_time = (max(simulated_delay))
-    total_training_time += training_time
-    if iter == 0:
-        first_training_time = training_time
-    wandb.log({"Training_time_clients": total_training_time, "epoch": iter}, commit=False)
-    times_in_server = []
-    time_train_server_train_all_list.append(time_train_server_train_all)
-    time_train_server_train_all = 0
+        wandb.log({"Active_Clients": m, "epoch": iter}, commit=False)
 
-    # -------------------------------------------------------------------
-    # Privacy: per-round aggregate logging and (ε, δ)-DP accounting
-    # (privacy-implementation-plan.md §6, §7)
-    # -------------------------------------------------------------------
-    if privacy_enable and privacy_metrics and (iter % privacy_log_interval == 0):
-        # Log the current noise multiplier (already logged above, duplicated
-        # here with commit=False so it groups with the DP epsilon in one step)
-        wandb.log({"Privacy/noise_multiplier": sigma_t, "epoch": iter}, commit=False)
+        for idx in active_idxs_users:
+            # Log the client tier for each client in WandB
+            wandb.log({"Client{}_Tier".format(idx): num_tiers - client_tier[idx] + 1, "epoch": iter}, commit=False) # tier 1 smallest model
+        
+        
+            data_server_to_client = calculate_data_size(w_glob_client_tier[client_tier[idx]])
+            simulated_delay[idx] = data_server_to_client / net_speed[idx]
+            
+            
+            client_model_parameter_data_size = 0
+            time_train_test_s = time.time()
+            net_glob_client = net_model_client_tier[client_tier[idx]]
+            w_glob_client_tier[client_tier[idx]] = net_glob_client_tier[client_tier[idx]].state_dict() # may be I can eliminate this line
+            local = Client(net_glob_client, idx, lr, device, dataset_train = dataset_train, dataset_test = dataset_test, idxs = [], idxs_test = [])
+            
 
-        # (ε, δ)-DP accounting via Opacus (§6)
-        # Sampling rate q = batch_size / avg local dataset size
-        q = args.batch_size / max(avg_dataset, 1)
-        # Steps consumed this round: one optimizer step per batch per client epoch
-        # (conservative: uses the maximum local epoch count).
-        # Use the active-client count (m) so DP accounting reflects the
-        # clients that actually trained after DEATS dropouts.
-        steps_this_round = int(m * max(client_epoch))
-        epsilon = get_dp_epsilon(
-            sample_rate=q,
-            noise_multiplier=sigma_t,
-            num_steps=steps_this_round,
-            delta=privacy_delta,
-        )
-        if epsilon is not None:
-            wandb.log({"Privacy/epsilon": epsilon, "epoch": iter}, commit=False)
-            print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | epsilon={epsilon:.4f} | delta={privacy_delta}")
-        else:
-            print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | (ε,δ) accounting unavailable (install opacus)")
+            # Training ------------------
+            [w_client, duration, client_intermediate_data_size] = local.train(
+                net=copy.deepcopy(net_glob_client).to(device),
+                round_idx=iter,
+            )
+            
+            w_locals_client.append(copy.deepcopy(w_client))
+            w_locals_client_tier[client_tier[idx]].append(copy.deepcopy(w_client))
+        
+            client_observed_time[idx] = duration
+        
+        
+            client_model_parameter_data_size = calculate_data_size(w_client)
+            model_parameter_data_size += client_model_parameter_data_size         
+        
+            data_transmitted_client = client_intermediate_data_size + client_model_parameter_data_size
+        
+            # add to dic last observation
+            data_transmitted_client_all[idx] = data_transmitted_client
+        
+            simulated_delay[idx] += compute_delay(data_transmitted_client, net_speed[idx]
+                                                  , delay_coefficient[idx], duration) # this is simulated delay
+
+            if deats_scheduler is not None:
+                energy_drain = deats_scheduler.battery.drain(
+                    client_id=idx,
+                    duration=duration,
+                    data_transmitted=data_transmitted_client,
+                    net_speed=net_speed[idx],
+                    delay_coefficient=delay_coefficient[idx],
+                    code_tier=client_tier[idx],
+                    num_tiers=num_tiers,
+                )
+                deats_scheduler.update_ema(idx, energy_drain)
+                deats_scheduler.record_relative_energy(idx, energy_drain)
+                wandb.log({
+                    f"Client{idx}_Battery": deats_scheduler.battery.get_battery(idx),
+                    f"Client{idx}_EnergyDrain": energy_drain,
+                    f"Client{idx}_EMA_Energy": deats_scheduler.battery.clients[idx].ema_energy_rate,
+                    "epoch": iter,
+                }, commit=False)
+
+            wandb.log({"Client{}_Total_Delay".format(idx): simulated_delay[idx], "epoch": iter}, commit=False)
+
+        if privacy_enable and privacy_round_protected_batches > 0:
+            cumulative_q = min(args.batch_size / max(avg_dataset, 1), 1.0)
+            privacy_rdp_events.append((cumulative_q, sigma_t, privacy_round_protected_batches))
+
+        server_wait_first_to_last_client = (max(simulated_delay * client_epoch) - min(simulated_delay * client_epoch))
+        training_time = (max(simulated_delay))
+        total_training_time += training_time
+        if iter == 0:
+            first_training_time = training_time
+        wandb.log({"Training_time_clients": total_training_time, "epoch": iter}, commit=False)
+        times_in_server = []
+        time_train_server_train_all_list.append(time_train_server_train_all)
+        time_train_server_train_all = 0
+
+        # -------------------------------------------------------------------
+        # Privacy: per-round aggregate logging and (ε, δ)-DP accounting
+        # (privacy-implementation-plan.md §6, §7)
+        # -------------------------------------------------------------------
+        if privacy_enable and privacy_metrics and (iter % privacy_log_interval == 0):
+            # Log the current noise multiplier (already logged above, duplicated
+            # here with commit=False so it groups with the DP epsilon in one step)
+            wandb.log({"Privacy/noise_multiplier": sigma_t, "epoch": iter}, commit=False)
+
+            # (ε, δ)-DP accounting via Opacus (§6)
+            # Sampling rate q = batch_size / avg local dataset size
+            q = args.batch_size / max(avg_dataset, 1)
+            # Steps consumed this round: one optimizer step per batch per client epoch
+            # (conservative: uses the maximum local epoch count).
+            # Use the active-client count (m) so DP accounting reflects the
+            # clients that actually trained after DEATS dropouts.
+            steps_this_round = int(m * max(client_epoch))
+            epsilon = get_dp_epsilon(
+                sample_rate=q,
+                noise_multiplier=sigma_t,
+                num_steps=steps_this_round,
+                delta=privacy_delta,
+            )
+            if epsilon is not None:
+                wandb.log({"Privacy/epsilon": epsilon, "epoch": iter}, commit=False)
+                print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | epsilon={epsilon:.4f} | delta={privacy_delta}")
+            else:
+                print(f"[Privacy] Round {iter:3d} | sigma_t={sigma_t:.4f} | (ε,δ) accounting unavailable (install opacus)")
      
-    simulated_delay[simulated_delay==0] = np.nan  # convert zeros to nan, for when some clients not involved in the epoch
-    simulated_delay_historical_df = pd.concat([simulated_delay_historical_df, pd.DataFrame(simulated_delay).T], ignore_index=True)
-    client_observed_times = pd.concat([client_observed_times, pd.DataFrame(client_observed_time).T], ignore_index=True)
-    client_epoch_last = client_epoch.copy()
+        simulated_delay[simulated_delay==0] = np.nan  # convert zeros to nan, for when some clients not involved in the epoch
+        simulated_delay_historical_df = pd.concat([simulated_delay_historical_df, pd.DataFrame(simulated_delay).T], ignore_index=True)
+        client_observed_times = pd.concat([client_observed_times, pd.DataFrame(client_observed_time).T], ignore_index=True)
+        client_epoch_last = client_epoch.copy()
     
-    idxs_users, m = get_random_user_indices(num_users, DEFAULT_FRAC)
+        idxs_users, m = get_random_user_indices(num_users, DEFAULT_FRAC)
     
         
-    [client_tier, T_max, computation_time_clients] = TierScheduler(
-        computation_time_clients,
-        T_max,
-        client_tier_all=client_tier_all,
-        delay_history=simulated_delay_historical_df,
-        num_tiers=num_tiers,
-        client_epoch=client_epoch,
-        num_users=num_users,
-        dataset_size=dataset_size,
-        batch_size=args.batch_size,
-        data_transmitted_client_all=data_transmitted_client_all,
-        net_speed=net_speed,
-        deats_scheduler=deats_scheduler,
-        remaining_rounds=max(epochs - iter - 1, 1),
-    )
-    wandb.log({"max_time": T_max, "epoch": iter}, commit=False)
+        [client_tier, T_max, computation_time_clients] = TierScheduler(
+            computation_time_clients,
+            T_max,
+            client_tier_all=client_tier_all,
+            delay_history=simulated_delay_historical_df,
+            num_tiers=num_tiers,
+            client_epoch=client_epoch,
+            num_users=num_users,
+            dataset_size=dataset_size,
+            batch_size=args.batch_size,
+            data_transmitted_client_all=data_transmitted_client_all,
+            net_speed=net_speed,
+            deats_scheduler=deats_scheduler,
+            remaining_rounds=max(epochs - iter - 1, 1),
+        )
+        wandb.log({"max_time": T_max, "epoch": iter}, commit=False)
                                                     
-    client_tier_all.append(copy.deepcopy(client_tier))
+        client_tier_all.append(copy.deepcopy(client_tier))
     
 
     
-    for i in client_tier.keys():  # assign each server-side to its tier model
-        net_model_server_tier[i] = net_glob_server_tier[client_tier[i]]
+        for i in client_tier.keys():  # assign each server-side to its tier model
+            net_model_server_tier[i] = net_glob_server_tier[client_tier[i]]
 
-    # Ater serving all clients for its local epochs------------
-    # Fed  Server: Federation process at Client-Side-----------
-    print("-----------------------------------------------------------")
-    print("{:^59}".format("Model Aggregation"))
-    print("-----------------------------------------------------------")
+        # Ater serving all clients for its local epochs------------
+        # Fed  Server: Federation process at Client-Side-----------
+        print("-----------------------------------------------------------")
+        print("{:^59}".format("Model Aggregation"))
+        print("-----------------------------------------------------------")
     
-    # calculate the number of samples in each client
-    # Use the clients that actually trained this round (active_idxs_users),
-    # in the same order their weights were appended to w_locals_client.
-    # Using idxs_users here was incorrect because it is reassigned above to
-    # the *next* round's sample, which misaligned the FedAvg weighting.
-    client_sample = calculate_client_samples(train_data_local_num_dict, active_idxs_users, args.dataset) # same order as appended weights
+        # calculate the number of samples in each client
+        # Use the clients that actually trained this round (active_idxs_users),
+        # in the same order their weights were appended to w_locals_client.
+        # Using idxs_users here was incorrect because it is reassigned above to
+        # the *next* round's sample, which misaligned the FedAvg weighting.
+        client_sample = calculate_client_samples(train_data_local_num_dict, active_idxs_users, args.dataset) # same order as appended weights
         
 
     
     
             
-    w_glob = aggregated_fedavg(w_locals_tier, w_locals_client, num_tiers, num_users, whether_local_loss, client_sample, idxs_users) # w_locals_tier is for server-side
+        # FIX 4: Guard aggregated_fedavg against empty weight lists.
+        # If all clients dropped out via DEATS, w_locals_client / w_locals_tier may
+        # be empty even after the m==0 guard. Skip aggregation and carry forward
+        # existing global weights instead of crashing.
+        if not w_locals_client or not w_locals_tier:
+            logging.warning(
+                f"[Round {iter}] No client weights collected — skipping aggregation "
+                "and carrying forward previous global weights."
+            )
+        else:
+            w_glob = aggregated_fedavg(w_locals_tier, w_locals_client, num_tiers, num_users, whether_local_loss, client_sample, idxs_users) # w_locals_tier is for server-side
 
-    # TITAN Step 5 — server-side EMA of the aggregated global weights.
-    # When --use_titan_ema is set, w_glob is replaced with the smoothed EMA
-    # state. The raw average is still computed (above) so FedAvg semantics
-    # are preserved on every call; the EMA only changes what gets *broadcast*
-    # and *evaluated*. Falls through unchanged when EMA is disabled.
-    if titan_server_ema is not None:
-        w_glob = titan_server_ema.update(w_glob)
+            # TITAN Step 5 — server-side EMA of the aggregated global weights.
+            # When --use_titan_ema is set, w_glob is replaced with the smoothed EMA
+            # state. The raw average is still computed (above) so FedAvg semantics
+            # are preserved on every call; the EMA only changes what gets *broadcast*
+            # and *evaluated*. Falls through unchanged when EMA is disabled.
+            if titan_server_ema is not None:
+                w_glob = titan_server_ema.update(w_glob)
 
-    for t in range(1, num_tiers+1):
-        for k in w_glob_client_tier[t].keys():
-            if k in w_glob_server_tier[t].keys():  # This is local updading  // another method can be updating and supoose its similar to global model
-                if w_locals_client_tier[t] != []:
-                    w_glob_client_tier[t][k] = FedAvg(w_locals_client_tier[t])[k]
-                    continue
-                else:
-                    continue 
-            
-            w_glob_client_tier[t][k] = w_glob[k]
-        for k in w_glob_server_tier[t].keys():
-            w_glob_server_tier[t][k] = w_glob[k]
-            
-        net_glob_client_tier[t].load_state_dict(w_glob_client_tier[t])
-        net_glob_server_tier[t].load_state_dict(w_glob_server_tier[t])
+            for t in range(1, num_tiers+1):
+                for k in w_glob_client_tier[t].keys():
+                    if k in w_glob_server_tier[t].keys():  # This is local updading  // another method can be updating and supoose its similar to global model
+                        if w_locals_client_tier[t] != []:
+                            w_glob_client_tier[t][k] = FedAvg(w_locals_client_tier[t])[k]
+                            continue
+                        else:
+                            continue 
+                
+                    w_glob_client_tier[t][k] = w_glob[k]
+                for k in w_glob_server_tier[t].keys():
+                    w_glob_server_tier[t][k] = w_glob[k]
+                
+                net_glob_client_tier[t].load_state_dict(w_glob_client_tier[t])
+                net_glob_server_tier[t].load_state_dict(w_glob_server_tier[t])
 
-    global_eval_tier = num_tiers
-    evaluate_global_split_model(
-        net_glob_client_tier[global_eval_tier],
-        net_glob_server_tier[global_eval_tier],
-        test_data_global,
-        iter,
-        global_eval_tier,
-    )
+        global_eval_tier = num_tiers
+        evaluate_global_split_model(
+            net_glob_client_tier[global_eval_tier],
+            net_glob_server_tier[global_eval_tier],
+            test_data_global,
+            iter,
+            global_eval_tier,
+        )
  
 
     
-    print(f'Size of Total Model Parameter Data Transferred {(model_parameter_data_size/1024**2):,.2f} Mega Byte')
-    print(f'Size of Total Intermediate Data Transferred {(intermediate_data_size/1024**2):,.2f} Mega Byte')
+        print(f'Size of Total Model Parameter Data Transferred {(model_parameter_data_size/1024**2):,.2f} Mega Byte')
+        print(f'Size of Total Intermediate Data Transferred {(intermediate_data_size/1024**2):,.2f} Mega Byte')
 
-    wandb.log({"Model_Parameter_Data_Transmission(MB) ": model_parameter_data_size/1024**2, "epoch": iter}, commit=False)
-    wandb.log({"Intermediate_Data_Transmission(MB) ": intermediate_data_size/1024**2, "epoch": iter}, commit=True)
+        safe_wandb_log({"Model_Parameter_Data_Transmission(MB) ": model_parameter_data_size/1024**2, "epoch": iter}, commit=False)
+        safe_wandb_log({"Intermediate_Data_Transmission(MB) ": intermediate_data_size/1024**2, "epoch": iter}, commit=True)
 
-    active_clients_per_round_final.append(m)
-    round_time_seconds_final.append(time.time() - round_wall_start)
-    rounds_completed_final += 1
-
+        active_clients_per_round_final.append(m)
+        round_time_seconds_final.append(time.time() - round_wall_start)
+        rounds_completed_final += 1
+    except KeyboardInterrupt:
+        print(f"\n[ABORT] KeyboardInterrupt at round {iter}. Stopping cleanly.")
+        break
+    except Exception as _round_exc:
+        print(
+            f"\n[ERROR] Round {iter} crashed: "
+            f"{type(_round_exc).__name__}: {_round_exc}"
+        )
+        import traceback as _tb
+        _tb.print_exc()
+        raise
 
 elapsed = (time.time() - start_time)/60
 
