@@ -14,3 +14,7 @@ __pycache__/
 
 # Editor caches
 .puku/
+
+# Datasets & raw data
+data/PAD/
+data/isic2019/
