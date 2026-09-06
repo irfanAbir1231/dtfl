@@ -85,6 +85,7 @@ from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar
 from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
 from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
 from api.data_preprocessing.isic2019.data_loader import load_partition_data_isic2019
+from api.data_preprocessing.breakhis.data_loader import load_partition_data_breakhis
 
 import matplotlib
 matplotlib.use('Agg')
@@ -133,7 +134,7 @@ def add_args(parser):
     
     # Data loading and preprocessing related arguments
     parser.add_argument('--dataset', type=str, default='ham10000', metavar='N',
-                        help='dataset used for training: ham10000, flower, cifar10, cifar100, cinic10, isic')
+                        help='dataset used for training: ham10000, flower, cifar10, cifar100, cinic10, isic, breakhis')
     parser.add_argument('--data_dir', type=str, default='./data', help='data directory')
     parser.add_argument('--partition_method', type=str, default='hetero', metavar='N',
                         help='how to partition the dataset on local workers')
@@ -270,6 +271,7 @@ def add_args(parser):
 
 HAM10000_ALIASES   = {"ham10000", "flower", "flower_framework"}
 ISIC2019_ALIASES   = {"isic", "isic2019", "isic_2019", "isic-2019"}
+BREAKHIS_ALIASES   = {"breakhis", "breakhis_dataset", "break_his"}
 
 
 def normalize_dataset_name(dataset_name):
@@ -278,6 +280,8 @@ def normalize_dataset_name(dataset_name):
         return "ham10000"
     if dataset_key in ISIC2019_ALIASES:
         return "isic2019"
+    if dataset_key in BREAKHIS_ALIASES:
+        return "breakhis"
     return dataset_key
 
 
@@ -311,7 +315,7 @@ def build_criterion(dataset_name, train_loader, num_classes, target_device):
     """Build the loss criterion.  HAM10000 and ISIC2019 use inverse-frequency
     class weights to counteract severe class imbalance; all other datasets use
     an unweighted CrossEntropyLoss."""
-    if dataset_name not in ("ham10000", "isic2019"):
+    if dataset_name not in ("ham10000", "isic2019", "breakhis"):
         return nn.CrossEntropyLoss()
 
     labels = np.asarray(train_loader.dataset.target, dtype=np.int64)
@@ -500,6 +504,8 @@ elif args.dataset == 'ham10000':
     class_num = 7
 elif args.dataset == 'isic2019':
     class_num = 9
+elif args.dataset == 'breakhis':
+    class_num = 8
 else:
     raise ValueError(f"Unsupported dataset '{args.dataset}'.")
 
@@ -669,6 +675,12 @@ def load_data(args, dataset_name):
         # 'isic2019/' inside it automatically on first run.
         if not args.data_dir:
             args.data_dir = './data'
+    elif dataset_name == "breakhis":
+        data_loader = load_partition_data_breakhis
+        # data_dir defaults to './data'; the loader creates a sub-directory
+        # 'breakhis/' inside it automatically on first run.
+        if not args.data_dir:
+            args.data_dir = './data'
     else:
         raise ValueError(f"Unsupported dataset '{dataset_name}'.")
 
@@ -695,6 +707,17 @@ def load_data(args, dataset_name):
 
     elif dataset_name == "isic2019":
         # ISIC 2019 loader supports the same strong_aug flag as HAM10000.
+        train_data_num, test_data_num, train_data_global, test_data_global, \
+        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+        class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
+                                args.partition_alpha, args.client_number, args.batch_size,
+                                strong_aug=getattr(args, "use_titan_aug", False))
+
+        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
+
+    elif dataset_name == "breakhis":
+        # BreakHis loader supports the same strong_aug flag as HAM10000 / ISIC 2019.
         train_data_num, test_data_num, train_data_global, test_data_global, \
         train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
         class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
@@ -1280,6 +1303,10 @@ def compute_final_classwise_metrics(client_net, server_net, test_loader):
     elif args.dataset == "isic2019" and class_num == 9:
         class_labels = list(range(9))
         class_names = ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC", "UNK"]
+    elif args.dataset == "breakhis" and class_num == 8:
+        class_labels = list(range(8))
+        class_names = ["Adenosis", "Fibroadenoma", "Phyllodes_Tumor", "Tubular_Adenoma",
+                       "Ductal_Carcinoma", "Lobular_Carcinoma", "Mucinous_Carcinoma", "Papillary_Carcinoma"]
     else:
         class_labels = list(range(class_num))
         class_names = [str(i) for i in class_labels]
