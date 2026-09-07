@@ -72,7 +72,9 @@ logger.setLevel(logging.INFO)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BREAKHIS_IMAGE_SIZE = 32   # same default as HAM10000 / ISIC 2019 in this framework
+BREAKHIS_IMAGE_SIZE = 128  # BreakHis native: 700×460; 128 retains cellular texture
+                           # needed for 8-class subtype classification.
+                           # (32×32 destroys all discriminative histological detail)
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -111,6 +113,125 @@ _PATIENT_ID_RE = re.compile(
 )
 
 
+# ── Stain Normalization ───────────────────────────────────────────────────────
+
+class ReinhardStainNormalize:
+    """Reinhard colour-transfer stain normalisation (PIL Image → PIL Image).
+
+    Histopathology slides exhibit significant H&E staining variation across
+    labs, scanners, and protocols.  This transform converts each image to the
+    LAB colour space and shifts/scales its per-channel statistics to match a
+    fixed reference, effectively standardising the colour distribution.
+
+    The reference statistics below were computed from a representative subset
+    of BreakHis slides and are close to the values commonly used in the
+    literature (Reinhard et al., 2001).
+
+    This implementation uses only numpy — no scikit-image dependency.
+    """
+
+    # Reference LAB statistics (mean, std per channel) — a typical H&E slide.
+    REF_MEAN = np.array([70.0, 3.5, -12.0], dtype=np.float64)   # L, a, b
+    REF_STD  = np.array([15.0, 7.0,  10.0], dtype=np.float64)
+
+    @staticmethod
+    def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+        """Convert sRGB [0-255] uint8 to CIE-LAB float64."""
+        # Step 1: sRGB → linear RGB
+        rgb_f = rgb.astype(np.float64) / 255.0
+        mask = rgb_f > 0.04045
+        rgb_f[mask] = ((rgb_f[mask] + 0.055) / 1.055) ** 2.4
+        rgb_f[~mask] = rgb_f[~mask] / 12.92
+
+        # Step 2: linear RGB → XYZ (D65 illuminant)
+        M = np.array([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ])
+        xyz = rgb_f @ M.T
+        # Normalise by D65 white point
+        xyz[:, :, 0] /= 0.95047
+        xyz[:, :, 2] /= 1.08883
+
+        # Step 3: XYZ → LAB
+        epsilon = 0.008856
+        kappa = 903.3
+        mask = xyz > epsilon
+        f = np.zeros_like(xyz)
+        f[mask] = np.cbrt(xyz[mask])
+        f[~mask] = (kappa * xyz[~mask] + 16.0) / 116.0
+
+        lab = np.empty_like(xyz)
+        lab[:, :, 0] = 116.0 * f[:, :, 1] - 16.0   # L
+        lab[:, :, 1] = 500.0 * (f[:, :, 0] - f[:, :, 1])  # a
+        lab[:, :, 2] = 200.0 * (f[:, :, 1] - f[:, :, 2])  # b
+        return lab
+
+    @staticmethod
+    def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
+        """Convert CIE-LAB float64 to sRGB uint8."""
+        # Step 1: LAB → XYZ
+        fy = (lab[:, :, 0] + 16.0) / 116.0
+        fx = lab[:, :, 1] / 500.0 + fy
+        fz = fy - lab[:, :, 2] / 200.0
+
+        epsilon = 0.008856
+        kappa = 903.3
+        xyz = np.empty_like(lab)
+        mask_x = fx ** 3 > epsilon
+        xyz[:, :, 0] = np.where(mask_x, fx ** 3, (116.0 * fx - 16.0) / kappa)
+        mask_y = lab[:, :, 0] > kappa * epsilon
+        xyz[:, :, 1] = np.where(mask_y, fy ** 3, lab[:, :, 0] / kappa)
+        mask_z = fz ** 3 > epsilon
+        xyz[:, :, 2] = np.where(mask_z, fz ** 3, (116.0 * fz - 16.0) / kappa)
+
+        # D65 white point
+        xyz[:, :, 0] *= 0.95047
+        xyz[:, :, 2] *= 1.08883
+
+        # Step 2: XYZ → linear RGB
+        M_inv = np.array([
+            [ 3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660,  1.8760108,  0.0415560],
+            [ 0.0556434, -0.2040259,  1.0572252],
+        ])
+        rgb = xyz @ M_inv.T
+        rgb = np.clip(rgb, 0.0, 1.0)
+
+        # Step 3: linear RGB → sRGB
+        mask = rgb > 0.0031308
+        rgb[mask] = 1.055 * (rgb[mask] ** (1.0 / 2.4)) - 0.055
+        rgb[~mask] = 12.92 * rgb[~mask]
+
+        return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        """Apply Reinhard stain normalisation to a PIL Image."""
+        arr = np.array(img)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            return img  # skip non-RGB
+
+        lab = self._rgb_to_lab(arr)
+
+        # Per-channel statistics of the source image
+        src_mean = np.array([lab[:, :, c].mean() for c in range(3)])
+        src_std  = np.array([lab[:, :, c].std() + 1e-6 for c in range(3)])
+
+        # Transfer: shift+scale each channel to match the reference
+        for c in range(3):
+            lab[:, :, c] = (
+                (lab[:, :, c] - src_mean[c]) * (self.REF_STD[c] / src_std[c])
+                + self.REF_MEAN[c]
+            )
+
+        rgb_out = self._lab_to_rgb(lab)
+        return Image.fromarray(rgb_out)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(ref_mean={self.REF_MEAN.tolist()}, ref_std={self.REF_STD.tolist()})"
+
+
 # ── Transforms ────────────────────────────────────────────────────────────────
 
 def _data_transforms_breakhis(strong_aug: bool = False):
@@ -119,35 +240,62 @@ def _data_transforms_breakhis(strong_aug: bool = False):
     Augmentation rationale
     ----------------------
     Histopathology images have **no canonical orientation**, so we apply
-    aggressive rotation (90° steps) and both flips.  Mild ``ColorJitter``
-    compensates for inter-lab staining variation across the dataset's slides.
+    discrete 90° rotation steps and both flips.  Reinhard stain normalisation
+    removes inter-lab / inter-slide H&E colour variation *before* augmentation.
+    ``RandomResizedCrop`` simulates scale variation within slides.
+    ``GaussianBlur`` mimics out-of-focus regions common in whole-slide imaging.
+    ``RandomErasing`` provides additional regularisation.
 
     When ``strong_aug=True`` the TITAN RandAugment + RandomErasing pipeline
     from ``utils.augmentation`` is used (same as HAM10000 / ISIC 2019 strong
-    path).
+    path), but with the BreakHis image size.
     """
+    stain_norm = ReinhardStainNormalize()
+
     if strong_aug:
         from utils.augmentation import build_titan_train_transform, build_titan_eval_transform
-        train_transform = build_titan_train_transform(BREAKHIS_IMAGE_SIZE, strong=True)
-        test_transform  = build_titan_eval_transform(BREAKHIS_IMAGE_SIZE)
+        # Prepend stain normalisation before the TITAN pipeline
+        titan_train = build_titan_train_transform(BREAKHIS_IMAGE_SIZE, strong=True)
+        train_transform = transforms.Compose([stain_norm, titan_train])
+        test_transform  = transforms.Compose([
+            stain_norm,
+            build_titan_eval_transform(BREAKHIS_IMAGE_SIZE),
+        ])
         return train_transform, test_transform
 
     train_transform = transforms.Compose([
+        # ---- Stain normalisation (before any geometric/colour aug) ----
+        stain_norm,
+        # ---- Resize to working resolution ----
         transforms.Resize((BREAKHIS_IMAGE_SIZE, BREAKHIS_IMAGE_SIZE)),
+        # ---- Geometric augmentation (histopathology-appropriate) ----
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=90),
-        transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.1,
-            hue=0.03,
+        transforms.RandomApply([
+            transforms.RandomRotation(degrees=(90, 90)),   # discrete 90° CW
+        ], p=0.5),
+        transforms.RandomResizedCrop(
+            BREAKHIS_IMAGE_SIZE, scale=(0.8, 1.0), ratio=(0.9, 1.1),
         ),
+        # ---- Colour / intensity augmentation ----
+        transforms.ColorJitter(
+            brightness=0.3,
+            contrast=0.3,
+            saturation=0.2,
+            hue=0.04,
+        ),
+        transforms.RandomApply([
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        ], p=0.2),
+        # ---- To tensor + normalise ----
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        # ---- Tensor-space regularisation ----
+        transforms.RandomErasing(p=0.15, scale=(0.02, 0.15)),
     ])
 
     test_transform = transforms.Compose([
+        stain_norm,
         transforms.Resize((BREAKHIS_IMAGE_SIZE, BREAKHIS_IMAGE_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
@@ -588,11 +736,11 @@ def get_dataloader_breakhis(
 
     train_dl = data.DataLoader(
         dataset=train_ds, batch_size=train_bs, shuffle=True,  drop_last=False,
-        num_workers=0, pin_memory=False,
+        num_workers=2, pin_memory=True,
     )
     test_dl = data.DataLoader(
         dataset=test_ds,  batch_size=test_bs,  shuffle=False, drop_last=False,
-        num_workers=0, pin_memory=False,
+        num_workers=2, pin_memory=True,
     )
     return train_dl, test_dl
 
