@@ -72,9 +72,12 @@ logger.setLevel(logging.INFO)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BREAKHIS_IMAGE_SIZE = 128  # BreakHis native: 700×460; 128 retains cellular texture
-                           # needed for 8-class subtype classification.
-                           # (32×32 destroys all discriminative histological detail)
+BREAKHIS_IMAGE_SIZE = 64   # BreakHis native: 700×460 pixels.
+                           # 64×64 gives 4× more pixels than 32×32 (major accuracy
+                           # gain) while fitting in 24 GB GPU at batch_size=100
+                           # with 10 simultaneous client+server model copies.
+                           # 128×128 caused CUDA OOM: feature maps at the split
+                           # layer (B×16×128×128) exceed available VRAM.
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
