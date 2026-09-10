@@ -11,10 +11,10 @@ Key design decisions (mirroring ISIC 2019 data_loader.py):
   - One-time preprocessing writes persistent train/test CSVs and per-client
     shard CSVs to ``{data_dir}/breakhis/``.
   - BreakHis filenames encode a patient ID
-    (e.g. ``SOB_M_DC-14-11951-400-007.png`` → patient ``14-11951``).
+    (e.g. ``SOB_M_DC-14-11951-400-007.png`` → patient ``14-11951``) and the
+    magnification level (40X, 100X, 200X, 400X).
     A **patient-level** GroupShuffleSplit 80/20 is used to prevent cross-slide
     leakage from the same patient appearing in both train and test splits.
-    This mirrors the lesion_id grouping used in HAM10000.
   - Client shards are generated with Dirichlet-based (label-skewed)
     partitioning at the image level, matching the ``hetero`` partition_method
     used for CIFAR and ISIC 2019.
@@ -23,6 +23,10 @@ Key design decisions (mirroring ISIC 2019 data_loader.py):
     weight computation works identically to HAM10000 and ISIC 2019.
   - All four magnification levels (40X, 100X, 200X, 400X) are pooled together
     as independent samples — the standard approach in most BreakHis papers.
+  - On first run, pixel mean/std are computed from the training images and
+    saved to ``{work_dir}/breakhis_norm_stats.json`` so that BreakHis-specific
+    (not ImageNet) normalization is used.  This is critical because H&E
+    histopathology has a very different colour distribution from ImageNet.
 
 8 tumour-subtype classes (multi-class classification):
   Benign:
@@ -56,6 +60,7 @@ Dataset directory structure (inside the kagglehub cache):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -79,8 +84,14 @@ BREAKHIS_IMAGE_SIZE = 64   # BreakHis native: 700×460 pixels.
                            # 128×128 caused CUDA OOM: feature maps at the split
                            # layer (B×16×128×128) exceed available VRAM.
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
+# ImageNet stats kept as FALLBACK only — used if norm-stats CSV is missing.
+# At runtime the actual BreakHis pixel mean/std is computed from training images
+# and used instead (see _load_or_compute_norm_stats).
+# H&E histopathology has a very different color distribution from ImageNet
+# (R~0.78, G~0.60, B~0.72 vs ImageNet R~0.485, G~0.456, B~0.406), so using
+# ImageNet stats shifts all pixel values by ~0.3 in the wrong direction.
+_FALLBACK_MEAN = [0.485, 0.456, 0.406]
+_FALLBACK_STD  = [0.229, 0.224, 0.225]
 
 # Ordered class labels — the index is the integer label used throughout.
 BREAKHIS_CLASSES = ["A", "F", "PT", "TA", "DC", "LC", "MC", "PC"]
@@ -109,199 +120,205 @@ _FOLDER_TO_CLASS_IDX: dict[str, int] = {
 
 # Regex to parse the patient ID from a standard BreakHis filename.
 # Format: SOB_{type}_{subtype}-{patient_id}-{magnification}-{seq}.{ext}
-# Example: SOB_M_DC-14-11951-400-007.png  → patient = "14-11951"
+# Example: SOB_M_DC-14-11951-400-007.png  → patient = "14-11951", mag = "400"
 _PATIENT_ID_RE = re.compile(
-    r"^SOB_[BM]_[A-Za-z]+-(\d+-[\dA-Za-z]+)-\d+[Xx]?-\d+",
+    r"^SOB_[BM]_[A-Za-z]+-(\d+-[\dA-Za-z]+)-(\d+)[Xx]?-\d+",
     re.IGNORECASE,
 )
 
 
-# ── Stain Normalization ───────────────────────────────────────────────────────
+# ── Dataset-specific normalization stats ─────────────────────────────────────
 
-class ReinhardStainNormalize:
-    """Reinhard colour-transfer stain normalisation (PIL Image → PIL Image).
+def _load_or_compute_norm_stats(
+    work_dir: str,
+    train_df: pd.DataFrame | None = None,
+    n_samples: int = 1000,
+    seed: int = 42,
+) -> tuple[list[float], list[float]]:
+    """Load saved norm stats or compute them from training images.
 
-    Histopathology slides exhibit significant H&E staining variation across
-    labs, scanners, and protocols.  This transform converts each image to the
-    LAB colour space and shifts/scales its per-channel statistics to match a
-    fixed reference, effectively standardising the colour distribution.
+    H&E histopathology images have a fundamentally different colour distribution
+    from ImageNet (pinkish-purple instead of natural-scene colours).  Using the
+    wrong statistics shifts every normalised pixel by ~0.3 in the R and B
+    channels, crippling the model's ability to learn colour-based features.
 
-    The reference statistics below were computed from a representative subset
-    of BreakHis slides and are close to the values commonly used in the
-    literature (Reinhard et al., 2001).
+    This function computes the actual per-channel pixel mean and std from a
+    sample of training images and caches the result in
+    ``{work_dir}/breakhis_norm_stats.json`` so subsequent runs are fast.
 
-    This implementation uses only numpy — no scikit-image dependency.
+    Parameters
+    ----------
+    work_dir:
+        Directory where ``breakhis_norm_stats.json`` will be written.
+    train_df:
+        DataFrame with a ``path`` column.  Required on the first call (when no
+        cached stats exist).  Pass ``None`` on subsequent calls to just load.
+    n_samples:
+        Number of training images to sample for statistics computation.
+    seed:
+        Random seed for reproducible sampling.
+
+    Returns
+    -------
+    (mean, std) each a list of 3 floats in [0, 1] range.
     """
+    stats_path = os.path.join(work_dir, "breakhis_norm_stats.json")
 
-    # Reference LAB statistics (mean, std per channel) — a typical H&E slide.
-    REF_MEAN = np.array([70.0, 3.5, -12.0], dtype=np.float64)   # L, a, b
-    REF_STD  = np.array([15.0, 7.0,  10.0], dtype=np.float64)
+    if os.path.exists(stats_path):
+        with open(stats_path) as f:
+            d = json.load(f)
+        logger.info(
+            "Loaded BreakHis norm stats from cache: mean=%s  std=%s",
+            [round(v, 4) for v in d["mean"]],
+            [round(v, 4) for v in d["std"]],
+        )
+        return d["mean"], d["std"]
 
-    @staticmethod
-    def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
-        """Convert sRGB [0-255] uint8 to CIE-LAB float64."""
-        # Step 1: sRGB → linear RGB
-        rgb_f = rgb.astype(np.float64) / 255.0
-        mask = rgb_f > 0.04045
-        rgb_f[mask] = ((rgb_f[mask] + 0.055) / 1.055) ** 2.4
-        rgb_f[~mask] = rgb_f[~mask] / 12.92
+    if train_df is None:
+        logger.warning(
+            "No cached norm stats and no train_df provided — falling back to ImageNet stats."
+        )
+        return _FALLBACK_MEAN, _FALLBACK_STD
 
-        # Step 2: linear RGB → XYZ (D65 illuminant)
-        M = np.array([
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041],
-        ])
-        xyz = rgb_f @ M.T
-        # Normalise by D65 white point
-        xyz[:, :, 0] /= 0.95047
-        xyz[:, :, 2] /= 1.08883
+    logger.info(
+        "Computing BreakHis pixel statistics from %d training images …", n_samples
+    )
+    sample_df = train_df.sample(
+        min(n_samples, len(train_df)), random_state=seed
+    ).reset_index(drop=True)
 
-        # Step 3: XYZ → LAB
-        epsilon = 0.008856
-        kappa = 903.3
-        mask = xyz > epsilon
-        f = np.zeros_like(xyz)
-        f[mask] = np.cbrt(xyz[mask])
-        f[~mask] = (kappa * xyz[~mask] + 16.0) / 116.0
+    pixel_sum    = np.zeros(3, dtype=np.float64)
+    pixel_sq_sum = np.zeros(3, dtype=np.float64)
+    n_pixels     = 0
+    errors       = 0
 
-        lab = np.empty_like(xyz)
-        lab[:, :, 0] = 116.0 * f[:, :, 1] - 16.0   # L
-        lab[:, :, 1] = 500.0 * (f[:, :, 0] - f[:, :, 1])  # a
-        lab[:, :, 2] = 200.0 * (f[:, :, 1] - f[:, :, 2])  # b
-        return lab
+    for path in sample_df["path"]:
+        try:
+            with Image.open(path) as img:
+                arr = np.array(img.convert("RGB")).astype(np.float64) / 255.0
+                pixel_sum    += arr.sum(axis=(0, 1))
+                pixel_sq_sum += (arr ** 2).sum(axis=(0, 1))
+                n_pixels     += arr.shape[0] * arr.shape[1]
+        except Exception as exc:
+            logger.debug("Skipping image %s: %s", path, exc)
+            errors += 1
 
-    @staticmethod
-    def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
-        """Convert CIE-LAB float64 to sRGB uint8."""
-        # Step 1: LAB → XYZ
-        fy = (lab[:, :, 0] + 16.0) / 116.0
-        fx = lab[:, :, 1] / 500.0 + fy
-        fz = fy - lab[:, :, 2] / 200.0
+    if errors:
+        logger.warning("Skipped %d images during norm-stat computation.", errors)
 
-        epsilon = 0.008856
-        kappa = 903.3
-        xyz = np.empty_like(lab)
-        mask_x = fx ** 3 > epsilon
-        xyz[:, :, 0] = np.where(mask_x, fx ** 3, (116.0 * fx - 16.0) / kappa)
-        mask_y = lab[:, :, 0] > kappa * epsilon
-        xyz[:, :, 1] = np.where(mask_y, fy ** 3, lab[:, :, 0] / kappa)
-        mask_z = fz ** 3 > epsilon
-        xyz[:, :, 2] = np.where(mask_z, fz ** 3, (116.0 * fz - 16.0) / kappa)
+    if n_pixels == 0:
+        logger.warning("No pixels processed — falling back to ImageNet stats.")
+        return _FALLBACK_MEAN, _FALLBACK_STD
 
-        # D65 white point
-        xyz[:, :, 0] *= 0.95047
-        xyz[:, :, 2] *= 1.08883
+    mean = (pixel_sum / n_pixels).tolist()
+    var  = pixel_sq_sum / n_pixels - (pixel_sum / n_pixels) ** 2
+    std  = np.maximum(var, 1e-8) ** 0.5
+    std  = std.tolist()
 
-        # Step 2: XYZ → linear RGB
-        M_inv = np.array([
-            [ 3.2404542, -1.5371385, -0.4985314],
-            [-0.9692660,  1.8760108,  0.0415560],
-            [ 0.0556434, -0.2040259,  1.0572252],
-        ])
-        rgb = xyz @ M_inv.T
-        rgb = np.clip(rgb, 0.0, 1.0)
+    logger.info(
+        "BreakHis norm stats computed: mean=%s  std=%s",
+        [round(v, 4) for v in mean],
+        [round(v, 4) for v in std],
+    )
 
-        # Step 3: linear RGB → sRGB
-        mask = rgb > 0.0031308
-        rgb[mask] = 1.055 * (rgb[mask] ** (1.0 / 2.4)) - 0.055
-        rgb[~mask] = 12.92 * rgb[~mask]
+    with open(stats_path, "w") as f:
+        json.dump({"mean": mean, "std": std}, f, indent=2)
 
-        return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-
-    def __call__(self, img: Image.Image) -> Image.Image:
-        """Apply Reinhard stain normalisation to a PIL Image."""
-        arr = np.array(img)
-        if arr.ndim != 3 or arr.shape[2] != 3:
-            return img  # skip non-RGB
-
-        lab = self._rgb_to_lab(arr)
-
-        # Per-channel statistics of the source image
-        src_mean = np.array([lab[:, :, c].mean() for c in range(3)])
-        src_std  = np.array([lab[:, :, c].std() + 1e-6 for c in range(3)])
-
-        # Transfer: shift+scale each channel to match the reference
-        for c in range(3):
-            lab[:, :, c] = (
-                (lab[:, :, c] - src_mean[c]) * (self.REF_STD[c] / src_std[c])
-                + self.REF_MEAN[c]
-            )
-
-        rgb_out = self._lab_to_rgb(lab)
-        return Image.fromarray(rgb_out)
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(ref_mean={self.REF_MEAN.tolist()}, ref_std={self.REF_STD.tolist()})"
+    return mean, std
 
 
 # ── Transforms ────────────────────────────────────────────────────────────────
 
-def _data_transforms_breakhis(strong_aug: bool = False):
+def _data_transforms_breakhis(
+    norm_mean: list[float] | None = None,
+    norm_std:  list[float] | None = None,
+    strong_aug: bool = False,
+):
     """Return (train_transform, test_transform) for BreakHis.
 
     Augmentation rationale
     ----------------------
-    Histopathology images have **no canonical orientation**, so we apply
-    discrete 90° rotation steps and both flips.  Reinhard stain normalisation
-    removes inter-lab / inter-slide H&E colour variation *before* augmentation.
-    ``RandomResizedCrop`` simulates scale variation within slides.
-    ``GaussianBlur`` mimics out-of-focus regions common in whole-slide imaging.
-    ``RandomErasing`` provides additional regularisation.
+    Train accuracy ≈ test accuracy (both ~46%) indicates **underfitting**, not
+    overfitting.  The augmentation is therefore designed to:
 
-    When ``strong_aug=True`` the TITAN RandAugment + RandomErasing pipeline
-    from ``utils.augmentation`` is used (same as HAM10000 / ISIC 2019 strong
-    path), but with the BreakHis image size.
+    1. Add training variety WITHOUT destroying discriminative signal.
+       Heavy regularisers (RandomErasing, strong ColorJitter) are removed
+       because they make underfitting worse.
+
+    2. Be histopathology-appropriate:
+       - Both flips and discrete 90° rotations are safe (tissue has no
+         canonical orientation).
+       - RandomResizedCrop with a tight scale range (0.85–1.0) simulates
+         viewing a slightly different region of the slide.
+       - Mild ColorJitter compensates for inter-slide staining variation.
+       - GaussianBlur (p=0.15) mimics out-of-focus areas in whole-slide imaging.
+
+    3. Use BreakHis-specific normalization statistics (not ImageNet) so the
+       network sees pixel distributions centred at zero after normalisation.
+       H&E images have R≈0.78, G≈0.60, B≈0.72 vs ImageNet R≈0.485, so using
+       ImageNet stats shifts all pixels by up to 0.3 in the wrong direction.
+
+    Parameters
+    ----------
+    norm_mean, norm_std:
+        Per-channel mean and std in [0, 1] range computed from the actual
+        BreakHis training images.  Fall back to ImageNet stats if None.
+    strong_aug:
+        When True, uses the TITAN RandAugment + RandomErasing pipeline from
+        ``utils.augmentation`` (designed for CIFAR-10 / HAM10000 tasks).
+        NOTE: strong_aug is NOT recommended for BreakHis because the model
+        is underfitting; it will make things worse.
     """
-    stain_norm = ReinhardStainNormalize()
+    mean = norm_mean if norm_mean is not None else _FALLBACK_MEAN
+    std  = norm_std  if norm_std  is not None else _FALLBACK_STD
 
     if strong_aug:
         from utils.augmentation import build_titan_train_transform, build_titan_eval_transform
-        # Prepend stain normalisation before the TITAN pipeline
-        titan_train = build_titan_train_transform(BREAKHIS_IMAGE_SIZE, strong=True)
-        train_transform = transforms.Compose([stain_norm, titan_train])
-        test_transform  = transforms.Compose([
-            stain_norm,
-            build_titan_eval_transform(BREAKHIS_IMAGE_SIZE),
-        ])
+        train_transform = build_titan_train_transform(BREAKHIS_IMAGE_SIZE, strong=True)
+        test_transform  = build_titan_eval_transform(BREAKHIS_IMAGE_SIZE)
         return train_transform, test_transform
 
     train_transform = transforms.Compose([
-        # ---- Stain normalisation (before any geometric/colour aug) ----
-        stain_norm,
-        # ---- Resize to working resolution ----
+        # ── Resize to working resolution ───────────────────────────────────
         transforms.Resize((BREAKHIS_IMAGE_SIZE, BREAKHIS_IMAGE_SIZE)),
-        # ---- Geometric augmentation (histopathology-appropriate) ----
+        # ── Geometry (histopathology-safe: no canonical orientation) ───────
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
+        # Discrete 90° rotation (equivalent to transposing) — safe for tissue.
+        # Applied with p=0.5 so roughly half of training images are rotated.
         transforms.RandomApply([
-            transforms.RandomRotation(degrees=(90, 90)),   # discrete 90° CW
+            transforms.RandomRotation(degrees=(90, 90)),
         ], p=0.5),
+        # Tight crop: simulate viewing a slightly different slide region.
+        # scale≥0.85 ensures we never crop away more than 15% of the image.
         transforms.RandomResizedCrop(
-            BREAKHIS_IMAGE_SIZE, scale=(0.8, 1.0), ratio=(0.9, 1.1),
+            BREAKHIS_IMAGE_SIZE, scale=(0.85, 1.0), ratio=(0.9, 1.1),
+            interpolation=transforms.InterpolationMode.BILINEAR,
         ),
-        # ---- Colour / intensity augmentation ----
+        # ── Colour (mild — compensate for inter-slide staining variation) ──
+        # Keep jitter small to avoid distorting the H&E colour signal that
+        # the model needs to learn from.
         transforms.ColorJitter(
-            brightness=0.3,
-            contrast=0.3,
-            saturation=0.2,
-            hue=0.04,
+            brightness=0.2,
+            contrast=0.25,
+            saturation=0.15,
+            hue=0.03,
         ),
+        # Mild blur: mimics occasional out-of-focus regions in WSI slides.
         transforms.RandomApply([
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
-        ], p=0.2),
-        # ---- To tensor + normalise ----
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+        ], p=0.15),
+        # ── To tensor + BreakHis-specific normalisation ────────────────────
         transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        # ---- Tensor-space regularisation ----
-        transforms.RandomErasing(p=0.15, scale=(0.02, 0.15)),
+        transforms.Normalize(mean, std),
+        # NOTE: RandomErasing deliberately REMOVED — the model is underfitting
+        # (train ≈ test ≈ 46%), so adding regularisation makes it worse.
     ])
 
     test_transform = transforms.Compose([
-        stain_norm,
         transforms.Resize((BREAKHIS_IMAGE_SIZE, BREAKHIS_IMAGE_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        transforms.Normalize(mean, std),
     ])
 
     return train_transform, test_transform
@@ -471,14 +488,34 @@ def _parse_patient_id(filename: str) -> str:
     return stem
 
 
+def _parse_magnification(filename: str) -> str:
+    """Extract the magnification level (40, 100, 200, 400) from a filename.
+
+    Returns the magnification string, or "unknown" on no match.
+
+    Examples
+    --------
+    >>> _parse_magnification("SOB_M_DC-14-11951-400-007.png")
+    '400'
+    >>> _parse_magnification("SOB_B_A-14-22549AB-40-001.png")
+    '40'
+    """
+    stem = os.path.splitext(filename)[0]
+    m = _PATIENT_ID_RE.match(stem)
+    if m:
+        return m.group(2)
+    return "unknown"
+
+
 def _build_master_dataframe(image_roots: list[tuple[str, int]]) -> pd.DataFrame:
     """Enumerate all images in the located directories → DataFrame.
 
     Returns a DataFrame with columns:
-      - ``path``       : absolute image path
-      - ``label``      : integer class index 0-7
-      - ``patient_id`` : patient identifier (for group-based splitting)
-      - ``subtype``    : human-readable subtype name
+      - ``path``         : absolute image path
+      - ``label``        : integer class index 0-7
+      - ``patient_id``   : patient identifier (for group-based splitting)
+      - ``subtype``      : human-readable subtype name
+      - ``magnification``: magnification level ("40", "100", "200", "400")
     """
     image_extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
     records = []
@@ -489,12 +526,14 @@ def _build_master_dataframe(image_roots: list[tuple[str, int]]) -> pd.DataFrame:
             if ext not in image_extensions:
                 continue
             full_path = os.path.join(img_dir, fname)
-            patient_id = _parse_patient_id(fname)
+            patient_id    = _parse_patient_id(fname)
+            magnification = _parse_magnification(fname)
             records.append({
-                "path":       full_path,
-                "label":      label_idx,
-                "patient_id": patient_id,
-                "subtype":    subtype_name,
+                "path":          full_path,
+                "label":         label_idx,
+                "patient_id":    patient_id,
+                "subtype":       subtype_name,
+                "magnification": magnification,
             })
 
     if not records:
@@ -513,6 +552,10 @@ def _build_master_dataframe(image_roots: list[tuple[str, int]]) -> pd.DataFrame:
     logger.info(
         "Class distribution:\n%s",
         df.groupby(["label", "subtype"]).size().to_string(),
+    )
+    logger.info(
+        "Magnification distribution:\n%s",
+        df["magnification"].value_counts().sort_index().to_string(),
     )
     return df
 
@@ -594,6 +637,14 @@ def _stratified_train_test_split(
 def _ensure_preprocessed(data_dir: str) -> str:
     """Download and preprocess BreakHis if not already done.
 
+    On first run:
+      1. Downloads via kagglehub.
+      2. Builds the master DataFrame (with patient_id + magnification).
+      3. Performs a patient-level 80/20 train/test split.
+      4. Saves train/test CSVs.
+      5. Computes BreakHis-specific pixel normalization stats from training
+         images and saves them to ``breakhis_norm_stats.json``.
+
     Returns the ``breakhis/`` working directory that holds all CSVs.
     """
     work_dir = os.path.normpath(os.path.join(data_dir, "breakhis"))
@@ -604,9 +655,16 @@ def _ensure_preprocessed(data_dir: str) -> str:
 
     if os.path.exists(train_csv) and os.path.exists(test_csv):
         logger.info("Found existing BreakHis metadata CSVs — skipping preprocessing.")
+        # Still try to compute norm stats if missing (handles upgrade from old runs)
+        _load_or_compute_norm_stats(
+            work_dir,
+            train_df=pd.read_csv(train_csv) if not os.path.exists(
+                os.path.join(work_dir, "breakhis_norm_stats.json")
+            ) else None,
+        )
         return work_dir
 
-    # First run: download → locate → build → split → save
+    # First run: download → locate → build → split → save → stats
     dataset_root = _download_breakhis()
     image_roots  = _locate_image_roots(dataset_root)
     master_df    = _build_master_dataframe(image_roots)
@@ -618,6 +676,10 @@ def _ensure_preprocessed(data_dir: str) -> str:
 
     logger.info("Train split: %d images saved to %s", len(train_df), train_csv)
     logger.info("Test  split: %d images saved to %s", len(test_df),  test_csv)
+
+    # Compute and cache dataset-specific normalization stats from training images.
+    # This is done ONCE and reused on all subsequent runs.
+    _load_or_compute_norm_stats(work_dir, train_df=train_df, n_samples=1000)
 
     return work_dir
 
@@ -727,9 +789,21 @@ def get_dataloader_breakhis(
     train_bs: int,
     test_bs: int,
     strong_aug: bool = False,
+    norm_mean: list[float] | None = None,
+    norm_std:  list[float] | None = None,
 ):
-    """Build a (train_loader, test_loader) pair from CSV paths."""
-    train_transform, test_transform = _data_transforms_breakhis(strong_aug=strong_aug)
+    """Build a (train_loader, test_loader) pair from CSV paths.
+
+    Parameters
+    ----------
+    norm_mean, norm_std:
+        Dataset-specific pixel normalization stats.  Computed from the actual
+        BreakHis training images by ``_load_or_compute_norm_stats`` and passed
+        here so every DataLoader (global and per-client) uses identical stats.
+    """
+    train_transform, test_transform = _data_transforms_breakhis(
+        norm_mean=norm_mean, norm_std=norm_std, strong_aug=strong_aug
+    )
 
     train_df = pd.read_csv(train_csv)
     test_df  = pd.read_csv(test_csv)
@@ -737,6 +811,8 @@ def get_dataloader_breakhis(
     train_ds = BreakHisDataset(train_df, transform=train_transform)
     test_ds  = BreakHisDataset(test_df,  transform=test_transform)
 
+    # num_workers=2: prefetch batches in background threads.
+    # pin_memory=True: faster CPU→GPU transfer for larger 64×64 images.
     train_dl = data.DataLoader(
         dataset=train_ds, batch_size=train_bs, shuffle=True,  drop_last=False,
         num_workers=2, pin_memory=True,
@@ -765,9 +841,10 @@ def load_partition_data_breakhis(
       1. Downloads the BreakHis dataset via kagglehub (if not cached).
       2. Parses and splits into train/test CSVs (saved in
          ``data_dir/breakhis/``), using a patient-level GroupShuffleSplit.
-      3. Creates per-client shard CSVs using Dirichlet partitioning.
+      3. Computes BreakHis-specific pixel normalization stats and caches them.
+      4. Creates per-client shard CSVs using Dirichlet partitioning.
 
-    Subsequent calls skip steps 1-3 and load directly from the saved CSVs.
+    Subsequent calls skip steps 1-4 and load directly from the saved CSVs.
 
     Returns
     -------
@@ -784,16 +861,22 @@ def load_partition_data_breakhis(
     train_csv = os.path.join(work_dir, "BreakHis_metadata_train.csv")
     test_csv  = os.path.join(work_dir, "BreakHis_metadata_test.csv")
 
-    # 2. Ensure client shards exist
+    # 2. Load dataset-specific normalization stats (computed from actual images).
+    #    Every DataLoader — global and per-client — uses the SAME stats so that
+    #    the normalisation is consistent across the entire federated system.
+    norm_mean, norm_std = _load_or_compute_norm_stats(work_dir)
+
+    # 3. Ensure client shards exist
     # When partition_method == "homo" use a very large alpha to approximate IID.
     alpha = partition_alpha if partition_method != "homo" else 1000.0
     client_csvs = _ensure_client_csvs(
         work_dir, train_csv, client_number, alpha, seed=42
     )
 
-    # 3. Build global loaders
+    # 4. Build global loaders
     train_data_global, test_data_global = get_dataloader_breakhis(
-        train_csv, test_csv, batch_size, batch_size, strong_aug=strong_aug
+        train_csv, test_csv, batch_size, batch_size,
+        strong_aug=strong_aug, norm_mean=norm_mean, norm_std=norm_std,
     )
 
     global_train_df = pd.read_csv(train_csv)
@@ -806,7 +889,7 @@ def load_partition_data_breakhis(
     logging.info("BreakHis train_dl_global batches = %d", len(train_data_global))
     logging.info("BreakHis test_dl_global  batches = %d", len(test_data_global))
 
-    # 4. Build per-client local loaders
+    # 5. Build per-client local loaders
     data_local_num_dict   = {}
     train_data_local_dict = {}
     test_data_local_dict  = {}
@@ -823,7 +906,8 @@ def load_partition_data_breakhis(
         )
 
         train_dl_local, _ = get_dataloader_breakhis(
-            client_csv, test_csv, batch_size, batch_size, strong_aug=strong_aug
+            client_csv, test_csv, batch_size, batch_size,
+            strong_aug=strong_aug, norm_mean=norm_mean, norm_std=norm_std,
         )
         logging.info(
             "BreakHis client_idx=%d, batch_num_train_local=%d",
