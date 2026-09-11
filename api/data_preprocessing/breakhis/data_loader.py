@@ -229,6 +229,19 @@ def _load_or_compute_norm_stats(
 
 # ── Transforms ────────────────────────────────────────────────────────────────
 
+class _IdentityTransform:
+    """No-op transform (picklable replacement for ``lambda img: img``).
+
+    ``transforms.Lambda(lambda img: img)`` cannot be pickled by Python's
+    multiprocessing module, which is required when ``num_workers > 0`` in a
+    DataLoader.  This named class is identical in behaviour but fully picklable.
+    """
+    def __call__(self, img):
+        return img
+
+    def __repr__(self) -> str:
+        return "IdentityTransform()"
+
 def _data_transforms_breakhis(
     norm_mean: list[float] | None = None,
     norm_std:  list[float] | None = None,
@@ -236,38 +249,48 @@ def _data_transforms_breakhis(
 ):
     """Return (train_transform, test_transform) for BreakHis.
 
-    Augmentation rationale
-    ----------------------
-    Train accuracy ≈ test accuracy (both ~46%) indicates **underfitting**, not
-    overfitting.  The augmentation is therefore designed to:
+    Augmentation rationale (overfitting regime: train~58%, test~42%)
+    -----------------------------------------------
+    The model is **overfitting** (train >> test gap = 16 pp).  The root cause
+    in federated learning is that each client's Dirichlet-skewed local shard
+    has severe class imbalance, causing per-client overfitting.  This is
+    addressed both here (regularising augmentation) and in the DataLoader
+    (WeightedRandomSampler, see ``_make_weighted_sampler``).
 
-    1. Add training variety WITHOUT destroying discriminative signal.
-       Heavy regularisers (RandomErasing, strong ColorJitter) are removed
-       because they make underfitting worse.
+    Augmentation choices:
 
-    2. Be histopathology-appropriate:
-       - Both flips and discrete 90° rotations are safe (tissue has no
-         canonical orientation).
-       - RandomResizedCrop with a tight scale range (0.85–1.0) simulates
-         viewing a slightly different region of the slide.
-       - Mild ColorJitter compensates for inter-slide staining variation.
-       - GaussianBlur (p=0.15) mimics out-of-focus areas in whole-slide imaging.
+    1. **Full 4-way discrete rotation** (0°/90°/180°/270°):
+       Tissue has no canonical orientation.  Using all four 90° steps gives
+       complete rotational invariance and 4× effective data augmentation.
 
-    3. Use BreakHis-specific normalization statistics (not ImageNet) so the
-       network sees pixel distributions centred at zero after normalisation.
-       H&E images have R≈0.78, G≈0.60, B≈0.72 vs ImageNet R≈0.485, so using
-       ImageNet stats shifts all pixels by up to 0.3 in the wrong direction.
+    2. **RandomResizedCrop (scale 0.80–1.0)**:
+       Slightly wider range than before; simulates different viewing regions
+       on the slide and reduces position-specific memorisation.
+
+    3. **ColorJitter (moderate)**:
+       Compensates for inter-lab H&E staining variation.
+
+    4. **GaussianBlur (p=0.15)**:
+       Mimics focus variation in whole-slide imaging.
+
+    5. **RandomErasing (p=0.2)** — RE-ENABLED for overfitting regime:
+       Randomly masks out 2–20% of the image.  Acts as a strong regulariser
+       that forces the model to classify from partial views, preventing it
+       from latching onto a single discriminative region.
+
+    6. **BreakHis-specific normalization** (not ImageNet):
+       H&E images have R≈0.78, G≈0.60, B≈0.72.  Using ImageNet stats
+       ([0.485, 0.456, 0.406]) shifts all pixels by up to 0.30 in the wrong
+       direction.  Actual dataset stats are computed once at preprocessing time.
 
     Parameters
     ----------
     norm_mean, norm_std:
-        Per-channel mean and std in [0, 1] range computed from the actual
-        BreakHis training images.  Fall back to ImageNet stats if None.
+        Per-channel mean and std in [0, 1] computed from actual BreakHis
+        training images.  Fall back to ImageNet stats if None.
     strong_aug:
         When True, uses the TITAN RandAugment + RandomErasing pipeline from
-        ``utils.augmentation`` (designed for CIFAR-10 / HAM10000 tasks).
-        NOTE: strong_aug is NOT recommended for BreakHis because the model
-        is underfitting; it will make things worse.
+        ``utils.augmentation``.
     """
     mean = norm_mean if norm_mean is not None else _FALLBACK_MEAN
     std  = norm_std  if norm_std  is not None else _FALLBACK_STD
@@ -281,38 +304,47 @@ def _data_transforms_breakhis(
     train_transform = transforms.Compose([
         # ── Resize to working resolution ───────────────────────────────────
         transforms.Resize((BREAKHIS_IMAGE_SIZE, BREAKHIS_IMAGE_SIZE)),
-        # ── Geometry (histopathology-safe: no canonical orientation) ───────
+        # ── Full 4-way geometry (histopathology has no canonical orientation) ─
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        # Discrete 90° rotation (equivalent to transposing) — safe for tissue.
-        # Applied with p=0.5 so roughly half of training images are rotated.
-        transforms.RandomApply([
-            transforms.RandomRotation(degrees=(90, 90)),
-        ], p=0.5),
-        # Tight crop: simulate viewing a slightly different slide region.
-        # scale≥0.85 ensures we never crop away more than 15% of the image.
+        # Full discrete 4-step rotation: 0° / 90° / 180° / 270°.
+        # Histopathology tissue is rotationally symmetric — a tumour cell looks
+        # identical at every 90° step.  Using all four steps gives complete
+        # rotational invariance and effectively 4× the training variety.
+        # NOTE: _IdentityTransform is used instead of lambda for picklability
+        # (DataLoader with num_workers>0 requires all transforms to be picklable).
+        transforms.RandomChoice([
+            _IdentityTransform(),                            # 0°  (no-op)
+            transforms.RandomRotation(degrees=(90,  90)),   # 90°
+            transforms.RandomRotation(degrees=(180, 180)),  # 180°
+            transforms.RandomRotation(degrees=(270, 270)),  # 270°
+        ]),
+        # Slightly wider crop range (0.80–1.0) vs previous (0.85–1.0) to
+        # simulate different viewing regions and reduce positional memorisation.
         transforms.RandomResizedCrop(
-            BREAKHIS_IMAGE_SIZE, scale=(0.85, 1.0), ratio=(0.9, 1.1),
+            BREAKHIS_IMAGE_SIZE, scale=(0.80, 1.0), ratio=(0.9, 1.1),
             interpolation=transforms.InterpolationMode.BILINEAR,
         ),
-        # ── Colour (mild — compensate for inter-slide staining variation) ──
-        # Keep jitter small to avoid distorting the H&E colour signal that
-        # the model needs to learn from.
+        # ── Colour (moderate — covers inter-lab staining variation) ─────────
         transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.25,
-            saturation=0.15,
-            hue=0.03,
+            brightness=0.25,
+            contrast=0.30,
+            saturation=0.20,
+            hue=0.04,
         ),
         # Mild blur: mimics occasional out-of-focus regions in WSI slides.
         transforms.RandomApply([
             transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
         ], p=0.15),
-        # ── To tensor + BreakHis-specific normalisation ────────────────────
+        # ── To tensor + BreakHis-specific normalisation ──────────────────
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
-        # NOTE: RandomErasing deliberately REMOVED — the model is underfitting
-        # (train ≈ test ≈ 46%), so adding regularisation makes it worse.
+        # ── RandomErasing: RE-ENABLED for overfitting regime ───────────────
+        # Masks 2–20% of the image to force classification from partial views.
+        # Prevents the model from memorising a single discriminative patch.
+        # p=0.20 is moderate: strong enough to regularise without degrading
+        # the signal the model needs to learn from.
+        transforms.RandomErasing(p=0.20, scale=(0.02, 0.20), ratio=(0.3, 3.3)),
     ])
 
     test_transform = transforms.Compose([
@@ -781,6 +813,60 @@ def _ensure_client_csvs(
     return client_csvs
 
 
+# ── Weighted sampler ────────────────────────────────────────────────────────────────
+
+def _make_weighted_sampler(dataset: BreakHisDataset) -> data.WeightedRandomSampler:
+    """Create a WeightedRandomSampler that balances class frequencies.
+
+    Motivation
+    ----------
+    In federated learning, each client receives a Dirichlet-skewed shard
+    (alpha=0.5 by default).  This creates severe within-client class imbalance:
+    one or two classes dominate each client's local data.
+
+    Without correction the model learns to predict the dominant local class
+    and ignores rare classes, causing high training accuracy (for the dominant
+    class) but poor generalisation on the balanced test set.
+
+    WeightedRandomSampler assigns each sample a weight inversely proportional
+    to its class frequency.  As a result, every epoch sees each class roughly
+    equally often, preventing the model from over-specialising to the dominant
+    class in each client's shard.
+
+    This is applied ONLY to training DataLoaders (per-client and global train).
+    The test DataLoader keeps the natural distribution.
+
+    Parameters
+    ----------
+    dataset:
+        A ``BreakHisDataset`` instance.  Uses ``dataset.target`` (the label
+        list) to compute per-class counts.
+
+    Returns
+    -------
+    WeightedRandomSampler with ``num_samples = len(dataset)`` and
+    ``replacement=True`` (required for oversampling minority classes).
+    """
+    import torch
+    labels       = np.array(dataset.target, dtype=np.int64)
+    class_counts = np.bincount(labels, minlength=CLASS_NUM).astype(np.float64)
+    class_counts  = np.maximum(class_counts, 1.0)   # avoid division by zero
+
+    # Weight for each sample = 1 / (count of its class) — minority classes
+    # get higher weight so they are sampled more often.
+    sample_weights = 1.0 / class_counts[labels]
+
+    logger.info(
+        "WeightedRandomSampler class counts: %s",
+        {i: int(c) for i, c in enumerate(class_counts.astype(int))},
+    )
+    return data.WeightedRandomSampler(
+        weights=torch.DoubleTensor(sample_weights),
+        num_samples=len(dataset),
+        replacement=True,
+    )
+
+
 # ── DataLoader factories ───────────────────────────────────────────────────────
 
 def get_dataloader_breakhis(
@@ -791,6 +877,7 @@ def get_dataloader_breakhis(
     strong_aug: bool = False,
     norm_mean: list[float] | None = None,
     norm_std:  list[float] | None = None,
+    use_weighted_sampler: bool = False,
 ):
     """Build a (train_loader, test_loader) pair from CSV paths.
 
@@ -800,6 +887,10 @@ def get_dataloader_breakhis(
         Dataset-specific pixel normalization stats.  Computed from the actual
         BreakHis training images by ``_load_or_compute_norm_stats`` and passed
         here so every DataLoader (global and per-client) uses identical stats.
+    use_weighted_sampler:
+        When True, replaces ``shuffle=True`` with a ``WeightedRandomSampler``
+        that balances class frequencies per epoch.  Use for training loaders
+        to counteract the class imbalance introduced by Dirichlet partitioning.
     """
     train_transform, test_transform = _data_transforms_breakhis(
         norm_mean=norm_mean, norm_std=norm_std, strong_aug=strong_aug
@@ -811,12 +902,21 @@ def get_dataloader_breakhis(
     train_ds = BreakHisDataset(train_df, transform=train_transform)
     test_ds  = BreakHisDataset(test_df,  transform=test_transform)
 
-    # num_workers=2: prefetch batches in background threads.
-    # pin_memory=True: faster CPU→GPU transfer for larger 64×64 images.
-    train_dl = data.DataLoader(
-        dataset=train_ds, batch_size=train_bs, shuffle=True,  drop_last=False,
-        num_workers=2, pin_memory=True,
-    )
+    # Weighted sampler balances class frequencies in each training epoch.
+    # shuffle=True is mutually exclusive with a custom sampler in PyTorch.
+    if use_weighted_sampler:
+        sampler = _make_weighted_sampler(train_ds)
+        train_dl = data.DataLoader(
+            dataset=train_ds, batch_size=train_bs,
+            sampler=sampler, drop_last=False,
+            num_workers=2, pin_memory=True,
+        )
+    else:
+        train_dl = data.DataLoader(
+            dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=False,
+            num_workers=2, pin_memory=True,
+        )
+
     test_dl = data.DataLoader(
         dataset=test_ds,  batch_size=test_bs,  shuffle=False, drop_last=False,
         num_workers=2, pin_memory=True,
@@ -873,10 +973,11 @@ def load_partition_data_breakhis(
         work_dir, train_csv, client_number, alpha, seed=42
     )
 
-    # 4. Build global loaders
+    # 4. Build global loaders (no weighted sampler — global train is balanced enough)
     train_data_global, test_data_global = get_dataloader_breakhis(
         train_csv, test_csv, batch_size, batch_size,
         strong_aug=strong_aug, norm_mean=norm_mean, norm_std=norm_std,
+        use_weighted_sampler=True,   # global shard also benefits from balancing
     )
 
     global_train_df = pd.read_csv(train_csv)
@@ -889,7 +990,10 @@ def load_partition_data_breakhis(
     logging.info("BreakHis train_dl_global batches = %d", len(train_data_global))
     logging.info("BreakHis test_dl_global  batches = %d", len(test_data_global))
 
-    # 5. Build per-client local loaders
+    # 5. Build per-client local loaders with WeightedRandomSampler.
+    #    Each client's Dirichlet shard is highly class-imbalanced.  The sampler
+    #    ensures every class is visited equally often per local epoch, which
+    #    directly reduces per-client overfitting and improves global generalisation.
     data_local_num_dict   = {}
     train_data_local_dict = {}
     test_data_local_dict  = {}
@@ -908,6 +1012,7 @@ def load_partition_data_breakhis(
         train_dl_local, _ = get_dataloader_breakhis(
             client_csv, test_csv, batch_size, batch_size,
             strong_aug=strong_aug, norm_mean=norm_mean, norm_std=norm_std,
+            use_weighted_sampler=True,   # ← key: balance per-client skewed shards
         )
         logging.info(
             "BreakHis client_idx=%d, batch_num_train_local=%d",
