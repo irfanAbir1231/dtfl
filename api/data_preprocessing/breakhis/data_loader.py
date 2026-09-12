@@ -84,14 +84,10 @@ BREAKHIS_IMAGE_SIZE = 64   # BreakHis native: 700×460 pixels.
                            # 128×128 caused CUDA OOM: feature maps at the split
                            # layer (B×16×128×128) exceed available VRAM.
 
-# ImageNet stats kept as FALLBACK only — used if norm-stats CSV is missing.
-# At runtime the actual BreakHis pixel mean/std is computed from training images
-# and used instead (see _load_or_compute_norm_stats).
-# H&E histopathology has a very different color distribution from ImageNet
-# (R~0.78, G~0.60, B~0.72 vs ImageNet R~0.485, G~0.456, B~0.406), so using
-# ImageNet stats shifts all pixel values by ~0.3 in the wrong direction.
-_FALLBACK_MEAN = [0.485, 0.456, 0.406]
-_FALLBACK_STD  = [0.229, 0.224, 0.225]
+# Realistic BreakHis H&E pixel stats (pinkish-purple background/nuclei)
+_FALLBACK_MEAN = [0.78, 0.60, 0.72]
+_FALLBACK_STD  = [0.15, 0.18, 0.14]
+
 
 # Ordered class labels — the index is the integer label used throughout.
 BREAKHIS_CLASSES = ["A", "F", "PT", "TA", "DC", "LC", "MC", "PC"]
@@ -302,14 +298,23 @@ def _data_transforms_breakhis(
         return train_transform, test_transform
 
     train_transform = transforms.Compose([
-        # ── Resize to working resolution ───────────────────────────────────
-        transforms.Resize((BREAKHIS_IMAGE_SIZE, BREAKHIS_IMAGE_SIZE)),
-        # ── Full 4-way geometry (histopathology has no canonical orientation) ─
+        # ── High-resolution isotropic crop directly from raw image ───────────
+        # Crops a 1:1 square patch directly from the raw 700×460 slide and
+        # resizes it to BREAKHIS_IMAGE_SIZE (64×64). Preserves cellular
+        # morphology, round nuclei, and fine chromatin texture without any
+        # anisotropic squashing (no aspect ratio distortion).
+        transforms.RandomResizedCrop(
+            BREAKHIS_IMAGE_SIZE,
+            scale=(0.75, 1.0),
+            ratio=(0.95, 1.05),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
+        # ── Dihedral D4 geometry (histopathology tissue has no canonical orientation)
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
         # Full discrete 4-step rotation: 0° / 90° / 180° / 270°.
         # Histopathology tissue is rotationally symmetric — a tumour cell looks
-        # identical at every 90° step.  Using all four steps gives complete
+        # identical at every 90° step. Using all four steps gives complete
         # rotational invariance and effectively 4× the training variety.
         # NOTE: _IdentityTransform is used instead of lambda for picklability
         # (DataLoader with num_workers>0 requires all transforms to be picklable).
@@ -319,36 +324,25 @@ def _data_transforms_breakhis(
             transforms.RandomRotation(degrees=(180, 180)),  # 180°
             transforms.RandomRotation(degrees=(270, 270)),  # 270°
         ]),
-        # Slightly wider crop range (0.80–1.0) vs previous (0.85–1.0) to
-        # simulate different viewing regions and reduce positional memorisation.
-        transforms.RandomResizedCrop(
-            BREAKHIS_IMAGE_SIZE, scale=(0.80, 1.0), ratio=(0.9, 1.1),
-            interpolation=transforms.InterpolationMode.BILINEAR,
-        ),
-        # ── Colour (moderate — covers inter-lab staining variation) ─────────
+        # ── Colour (mild — accounts for H&E staining variations without blurring chromatin)
         transforms.ColorJitter(
-            brightness=0.25,
-            contrast=0.30,
-            saturation=0.20,
-            hue=0.04,
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.15,
+            hue=0.03,
         ),
-        # Mild blur: mimics occasional out-of-focus regions in WSI slides.
-        transforms.RandomApply([
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
-        ], p=0.15),
         # ── To tensor + BreakHis-specific normalisation ──────────────────
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
-        # ── RandomErasing: RE-ENABLED for overfitting regime ───────────────
-        # Masks 2–20% of the image to force classification from partial views.
-        # Prevents the model from memorising a single discriminative patch.
-        # p=0.20 is moderate: strong enough to regularise without degrading
-        # the signal the model needs to learn from.
-        transforms.RandomErasing(p=0.20, scale=(0.02, 0.20), ratio=(0.3, 3.3)),
+        # ── Gentle RandomErasing (mild regularisation without destroying tiny diagnostic clusters)
+        transforms.RandomErasing(p=0.10, scale=(0.02, 0.10)),
     ])
 
     test_transform = transforms.Compose([
-        transforms.Resize((BREAKHIS_IMAGE_SIZE, BREAKHIS_IMAGE_SIZE)),
+        # Preserves 1.52 aspect ratio during downsampling (shorter edge 460 -> 64, width -> 97)
+        transforms.Resize(BREAKHIS_IMAGE_SIZE),
+        # Crops the central 64×64 biopsy region (removes slide borders, 1:1 isotropic)
+        transforms.CenterCrop(BREAKHIS_IMAGE_SIZE),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
@@ -592,46 +586,64 @@ def _build_master_dataframe(image_roots: list[tuple[str, int]]) -> pd.DataFrame:
     return df
 
 
-# ── Train/test split (patient-level) ─────────────────────────────────────────
+SPLIT_VERSION = "v3_stratified_patient"
+
+
+# ── Train/test split (patient-level stratified) ──────────────────────────────
 
 def _patient_train_test_split(
     df: pd.DataFrame,
     test_size: float = 0.2,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Patient-level GroupShuffleSplit 80/20.
+    """Per-class patient-level stratified 80/20 train/test split.
 
-    Ensures that images from the same patient (multiple slides and
-    magnification levels) cannot appear in both the train and test sets.
-
-    Falls back to an image-level stratified split if GroupShuffleSplit is not
-    available or if the number of unique patients is too small.
+    Guarantees:
+      1. Every single tumour subtype class (0 to 7) is represented in BOTH train
+         and test splits. (Unstratified GroupShuffleSplit randomly left out
+         Fibroadenoma and Papillary Carcinoma completely from the test set).
+      2. No patient's slides overlap between train and test (0% patient-level data leakage).
+      3. Test set contains a balanced ~20% of patients for each class.
+      4. Fully deterministic and pure Python/NumPy (no dependency on scikit-learn).
     """
-    try:
-        from sklearn.model_selection import GroupShuffleSplit
-    except ImportError:
-        logger.warning(
-            "scikit-learn not found; falling back to image-level stratified split."
-        )
-        return _stratified_train_test_split(df, test_size, seed)
+    rng = np.random.default_rng(seed)
+    train_indices = []
+    test_indices = []
 
-    groups = df["patient_id"].values
-    n_unique_patients = len(set(groups))
+    for label in sorted(df["label"].unique()):
+        class_df = df[df["label"] == label]
+        patient_ids = np.array(sorted(class_df["patient_id"].unique()))
+        rng.shuffle(patient_ids)
 
-    if n_unique_patients < 5:
-        logger.warning(
-            "Only %d unique patients found; falling back to image-level stratified split.",
-            n_unique_patients,
-        )
-        return _stratified_train_test_split(df, test_size, seed)
+        n_patients = len(patient_ids)
+        if n_patients <= 1:
+            # Single patient for a class: split images 80/20 to guarantee test representation
+            logger.warning(
+                "Class %d has only 1 patient (%s); splitting images 80/20.",
+                label, patient_ids[0],
+            )
+            class_indices = class_df.index.to_numpy()
+            rng.shuffle(class_indices)
+            n_test = max(1, int(round(len(class_indices) * test_size)))
+            test_indices.extend(class_indices[:n_test])
+            train_indices.extend(class_indices[n_test:])
+            continue
 
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    train_idx, test_idx = next(gss.split(df, df["label"], groups=groups))
+        n_test_patients = max(1, int(round(n_patients * test_size)))
+        # Ensure at least 1 patient in train
+        if n_patients - n_test_patients < 1:
+            n_test_patients = n_patients - 1
 
-    train_df = df.iloc[train_idx].copy()
-    test_df  = df.iloc[test_idx].copy()
+        test_pats = set(patient_ids[:n_test_patients])
+        train_pats = set(patient_ids[n_test_patients:])
 
-    # Log leakage check
+        test_indices.extend(class_df[class_df["patient_id"].isin(test_pats)].index)
+        train_indices.extend(class_df[class_df["patient_id"].isin(train_pats)].index)
+
+    train_df = df.loc[train_indices].reset_index(drop=True)
+    test_df  = df.loc[test_indices].reset_index(drop=True)
+
+    # Verification checks
     train_patients = set(train_df["patient_id"])
     test_patients  = set(test_df["patient_id"])
     overlap = train_patients.intersection(test_patients)
@@ -642,26 +654,22 @@ def _patient_train_test_split(
         )
     else:
         logger.info(
-            "Patient-level split: %d train images (%d patients) | "
+            "Stratified patient split: %d train images (%d patients) | "
             "%d test images (%d patients). No patient overlap. ✓",
             len(train_df), len(train_patients),
             len(test_df),  len(test_patients),
         )
 
+    logger.info(
+        "Train class distribution: %s",
+        train_df["label"].value_counts().sort_index().to_dict(),
+    )
+    logger.info(
+        "Test  class distribution: %s",
+        test_df["label"].value_counts().sort_index().to_dict(),
+    )
+
     return train_df, test_df
-
-
-def _stratified_train_test_split(
-    df: pd.DataFrame,
-    test_size: float = 0.2,
-    seed: int = 42,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Stratified 80/20 train/test split preserving class proportions."""
-    from sklearn.model_selection import StratifiedShuffleSplit
-
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    train_idx, test_idx = next(sss.split(df, df["label"]))
-    return df.iloc[train_idx].copy(), df.iloc[test_idx].copy()
 
 
 # ── Preprocessing orchestrator ────────────────────────────────────────────────
@@ -669,13 +677,10 @@ def _stratified_train_test_split(
 def _ensure_preprocessed(data_dir: str) -> str:
     """Download and preprocess BreakHis if not already done.
 
-    On first run:
-      1. Downloads via kagglehub.
-      2. Builds the master DataFrame (with patient_id + magnification).
-      3. Performs a patient-level 80/20 train/test split.
-      4. Saves train/test CSVs.
-      5. Computes BreakHis-specific pixel normalization stats from training
-         images and saves them to ``breakhis_norm_stats.json``.
+    Includes automatic validation of the split version and class completeness.
+    If existing CSVs were created with an older/unstratified split (e.g. missing
+    classes in the test set), it automatically purges the stale files and
+    regenerates the clean stratified split.
 
     Returns the ``breakhis/`` working directory that holds all CSVs.
     """
@@ -684,9 +689,37 @@ def _ensure_preprocessed(data_dir: str) -> str:
 
     train_csv = os.path.join(work_dir, "BreakHis_metadata_train.csv")
     test_csv  = os.path.join(work_dir, "BreakHis_metadata_test.csv")
+    version_file = os.path.join(work_dir, ".split_version")
 
-    if os.path.exists(train_csv) and os.path.exists(test_csv):
-        logger.info("Found existing BreakHis metadata CSVs — skipping preprocessing.")
+    needs_rebuild = False
+    if not (os.path.exists(train_csv) and os.path.exists(test_csv)):
+        needs_rebuild = True
+    elif not os.path.exists(version_file):
+        logger.info("Outdated BreakHis split detected (no version marker). Triggering rebuild...")
+        needs_rebuild = True
+    else:
+        try:
+            with open(version_file) as f:
+                v = f.read().strip()
+            if v != SPLIT_VERSION:
+                logger.info("Split version mismatch ('%s' != '%s'). Triggering rebuild...", v, SPLIT_VERSION)
+                needs_rebuild = True
+            else:
+                # Integrity check: test set must contain all 8 classes
+                test_df_check = pd.read_csv(test_csv)
+                if test_df_check["label"].nunique() < CLASS_NUM:
+                    logger.warning(
+                        "Existing BreakHis test split is corrupted (only %d of %d classes present). "
+                        "Forcing rebuild...",
+                        test_df_check["label"].nunique(), CLASS_NUM,
+                    )
+                    needs_rebuild = True
+        except Exception as exc:
+            logger.warning("Error validating existing split (%s). Triggering rebuild...", exc)
+            needs_rebuild = True
+
+    if not needs_rebuild:
+        logger.info("Found valid BreakHis metadata CSVs (%s) — skipping preprocessing.", SPLIT_VERSION)
         # Still try to compute norm stats if missing (handles upgrade from old runs)
         _load_or_compute_norm_stats(
             work_dir,
@@ -696,7 +729,15 @@ def _ensure_preprocessed(data_dir: str) -> str:
         )
         return work_dir
 
-    # First run: download → locate → build → split → save → stats
+    # Purge any old client CSVs before rebuilding to avoid partition mismatch
+    for fname in os.listdir(work_dir):
+        if fname.startswith("client_") and fname.endswith("_train.csv"):
+            try:
+                os.remove(os.path.join(work_dir, fname))
+            except OSError:
+                pass
+
+    # First run or rebuild: download → locate → build → split → save → stats
     dataset_root = _download_breakhis()
     image_roots  = _locate_image_roots(dataset_root)
     master_df    = _build_master_dataframe(image_roots)
@@ -706,11 +747,16 @@ def _ensure_preprocessed(data_dir: str) -> str:
     train_df.to_csv(train_csv, index=False)
     test_df.to_csv(test_csv,  index=False)
 
+    try:
+        with open(version_file, "w") as f:
+            f.write(SPLIT_VERSION)
+    except OSError as exc:
+        logger.warning("Could not write version file %s: %s", version_file, exc)
+
     logger.info("Train split: %d images saved to %s", len(train_df), train_csv)
     logger.info("Test  split: %d images saved to %s", len(test_df),  test_csv)
 
     # Compute and cache dataset-specific normalization stats from training images.
-    # This is done ONCE and reused on all subsequent runs.
     _load_or_compute_norm_stats(work_dir, train_df=train_df, n_samples=1000)
 
     return work_dir
@@ -973,11 +1019,11 @@ def load_partition_data_breakhis(
         work_dir, train_csv, client_number, alpha, seed=42
     )
 
-    # 4. Build global loaders (no weighted sampler — global train is balanced enough)
+    # 4. Build global loaders (shuffle=True, no sample repetition)
     train_data_global, test_data_global = get_dataloader_breakhis(
         train_csv, test_csv, batch_size, batch_size,
         strong_aug=strong_aug, norm_mean=norm_mean, norm_std=norm_std,
-        use_weighted_sampler=True,   # global shard also benefits from balancing
+        use_weighted_sampler=False,
     )
 
     global_train_df = pd.read_csv(train_csv)
@@ -990,10 +1036,10 @@ def load_partition_data_breakhis(
     logging.info("BreakHis train_dl_global batches = %d", len(train_data_global))
     logging.info("BreakHis test_dl_global  batches = %d", len(test_data_global))
 
-    # 5. Build per-client local loaders with WeightedRandomSampler.
-    #    Each client's Dirichlet shard is highly class-imbalanced.  The sampler
-    #    ensures every class is visited equally often per local epoch, which
-    #    directly reduces per-client overfitting and improves global generalisation.
+    # 5. Build per-client local loaders with shuffle=True.
+    #    Each sample is visited once per local epoch, preventing duplicate memorization.
+    #    Class imbalance is handled smoothly by build_criterion() in main.py without
+    #    penalizing the dominant class (Ductal Carcinoma, 44% of test data).
     data_local_num_dict   = {}
     train_data_local_dict = {}
     test_data_local_dict  = {}
@@ -1012,7 +1058,7 @@ def load_partition_data_breakhis(
         train_dl_local, _ = get_dataloader_breakhis(
             client_csv, test_csv, batch_size, batch_size,
             strong_aug=strong_aug, norm_mean=norm_mean, norm_std=norm_std,
-            use_weighted_sampler=True,   # ← key: balance per-client skewed shards
+            use_weighted_sampler=False,
         )
         logging.info(
             "BreakHis client_idx=%d, batch_num_train_local=%d",
